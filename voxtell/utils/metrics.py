@@ -52,6 +52,8 @@ def dice_iou(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-7):
         raise ValueError(f"Expected 4D array (P,Z,X,Y), got {pred.ndim}")
     if pred.shape[1] == 0:
         raise ValueError(f"Expected non-empty Z dimension, got shape {pred.shape}.")
+    if pred.shape[1] == 0:
+        raise ValueError(f"Expected non-empty Z dimension, got shape {pred.shape}.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pred_t = torch.from_numpy(pred).to(device).float()
