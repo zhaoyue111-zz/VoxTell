@@ -260,9 +260,7 @@ def main() -> int:
     if args.save_combined:
         if args.combine_strategy == "argmax":
             if len(args.prompts) == 1:
-                combined_seg = (
-                    (segmentations[0] >= args.combine_threshold).astype(np.uint8) * 1
-                )
+                combined_seg = (segmentations[0] >= args.combine_threshold).astype(np.uint8)
             else:
                 max_probs = np.max(segmentations, axis=0)
                 combined_seg = np.argmax(segmentations, axis=0).astype(np.uint8) + 1
@@ -270,6 +268,10 @@ def main() -> int:
 
             save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
             print(f"\nArgmax combine threshold: {args.combine_threshold}")
+            if len(args.prompts) > 1:
+                print("\nLabel mapping:")
+                for i, prompt in enumerate(args.prompts):
+                    print(f"  {i + 1}: {prompt}")
         else:
             # Show warning about overlapping structures
             if len(args.prompts) > 1:
@@ -292,11 +294,9 @@ def main() -> int:
                 for i, seg in enumerate(segmentations):
                     combined_seg[seg > 0] = i + 1
                 save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
-
-        if len(args.prompts) > 1:
-            print("\nLabel mapping:")
-            for i, prompt in enumerate(args.prompts):
-                print(f"  {i + 1}: {prompt}")
+                print("\nLabel mapping:")
+                for i, prompt in enumerate(args.prompts):
+                    print(f"  {i + 1}: {prompt}")
     else:
         # Default: Save each prompt as a separate file
         for i, prompt in enumerate(args.prompts):
