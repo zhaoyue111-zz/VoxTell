@@ -162,7 +162,7 @@ Examples:
         '--combine-threshold',
         type=float,
         default=0.5,
-        help='Background threshold for argmax combine strategy; voxels with max probability below this are set to 0'
+        help='Background threshold for argmax combine strategy (ignored for overwrite); voxels with max probability below this are set to 0'
     )
 
     parser.add_argument(
@@ -260,7 +260,9 @@ def main() -> int:
     if args.save_combined:
         if args.combine_strategy == "argmax":
             if len(args.prompts) == 1:
-                combined_seg = (segmentations[0] >= args.combine_threshold).astype(np.uint8)
+                combined_seg = (
+                    (segmentations[0] >= args.combine_threshold).astype(np.uint8) * 1
+                )
             else:
                 max_probs = np.max(segmentations, axis=0)
                 combined_seg = np.argmax(segmentations, axis=0).astype(np.uint8) + 1
