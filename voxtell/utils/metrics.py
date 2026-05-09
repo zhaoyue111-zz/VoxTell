@@ -38,8 +38,8 @@ def _confusion_from_binary(pred01: np.ndarray, gt01: np.ndarray):
 
 def dice_iou(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-7):
     """
-    输入 pred, gt: ndarray shape (P, Z, X, Y), 值为 {0, 1}
-    返回每个类别的 Dice 和 IoU (list[float])
+    pred, gt: ndarray shape (P, Z, X, Y), values {0, 1}
+    Returns per-class Dice and IoU (list[float]).
     """
     if pred.shape != gt.shape:
         raise ValueError(f"Shape mismatch: pred={pred.shape}, gt={gt.shape}.")
@@ -73,7 +73,7 @@ def dice_iou(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-7):
 def compute_metrics(pred, gt):
     """
     pred, gt: numpy arrays of shape [P, Z, X, Y], values {0,1}
-    返回每个类别的 IoU 和 Dice (list[float])
+    Returns per-class IoU and Dice (list[float]).
     """
     if pred.shape != gt.shape:
         raise ValueError(f"Shape mismatch: pred={pred.shape}, gt={gt.shape}.")
