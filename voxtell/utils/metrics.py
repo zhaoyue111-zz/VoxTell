@@ -50,6 +50,8 @@ def dice_iou(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-7):
         raise ValueError(f"Shape mismatch: pred={pred.shape}, gt={gt.shape}.")
     if pred.ndim != 4:
         raise ValueError(f"Expected 4D array (P,Z,X,Y), got {pred.ndim}")
+    if pred.shape[1] == 0:
+        raise ValueError(f"Expected non-empty Z dimension, got shape {pred.shape}.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pred_t = torch.from_numpy(pred).to(device).float()
@@ -117,8 +119,8 @@ def compute_metrics(pred, gt):
             mdice += dice
             miou += iou
 
-        dice_scores[class_idx] = mdice / Z if Z > 0 else 0.0
-        iou_scores[class_idx] = miou / Z if Z > 0 else 0.0
+        dice_scores[class_idx] = mdice / Z
+        iou_scores[class_idx] = miou / Z
 
     return dice_scores.tolist(), iou_scores.tolist()
 
