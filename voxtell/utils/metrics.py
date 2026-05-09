@@ -39,11 +39,12 @@ def _confusion_from_binary(pred01: np.ndarray, gt01: np.ndarray):
 def dice_iou(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-7):
     """
     输入 pred, gt: ndarray shape (P, Z, X, Y), 值为 {0, 1}
+    返回每个类别的 Dice 和 IoU (list[float])
     """
     if pred.shape != gt.shape:
         raise ValueError(f"Shape mismatch: pred={pred.shape}, gt={gt.shape}.")
     if pred.ndim != 4:
-        raise ValueError(f"Expected 4D array (P,X,Y,Z), got {pred.ndim}")
+        raise ValueError(f"Expected 4D array (P,Z,X,Y), got {pred.ndim}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pred_t = torch.from_numpy(pred).to(device).float()
@@ -67,36 +68,50 @@ def dice_iou(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-7):
     iou_vec = torch.where(gt_empty, pred_empty.float(), iou_vec)
     dice_vec = torch.where(gt_empty, pred_empty.float(), dice_vec)
 
-    return float(dice_vec.mean().item()), float(iou_vec.mean().item())
+    return dice_vec.detach().cpu().tolist(), iou_vec.detach().cpu().tolist()
 
 def compute_metrics(pred, gt):
     """
-    pred, gt: numpy arrays of shape [H,W], values {0,1}
-    返回 IoU 和 Dice
+    pred, gt: numpy arrays of shape [P, Z, X, Y], values {0,1}
+    返回每个类别的 IoU 和 Dice (list[float])
     """
-    pred_3d=pred[0]  # [Z, X,Y]
-    gt_3d=gt[0] #[Z,X,Y]
+    if pred.shape != gt.shape:
+        raise ValueError(f"Shape mismatch: pred={pred.shape}, gt={gt.shape}.")
+    if pred.ndim != 4:
+        raise ValueError(f"Expected 4D array (P,Z,X,Y), got {pred.ndim}")
 
-    mdice=0.0
-    miou=0.0
-    Z=pred_3d.shape[0]
-    for z in range(Z):
-        pred = pred_3d[z, :, :]  # [X,Y]
-        gt = gt_3d[z, :, :]# [X,Y]
+    num_classes = pred.shape[0]
+    dice_scores = np.zeros(num_classes, dtype=np.float64)
+    iou_scores = np.zeros(num_classes, dtype=np.float64)
 
-        pred = pred.astype(bool)
-        gt   = gt.astype(bool)
+    for class_idx in range(num_classes):
+        pred_3d = pred[class_idx]  # [Z, X, Y]
+        gt_3d = gt[class_idx]  # [Z, X, Y]
 
-        intersection = np.logical_and(pred, gt).sum()
-        union = np.logical_or(pred, gt).sum()
-        iou = intersection / union if union > 0 else 1.0
+        mdice = 0.0
+        miou = 0.0
+        Z = pred_3d.shape[0]
+        for z in range(Z):
+            pred_slice = pred_3d[z, :, :]  # [X,Y]
+            gt_slice = gt_3d[z, :, :]  # [X,Y]
 
-        dice = (2 * intersection) / (pred.sum() + gt.sum()) if (pred.sum() + gt.sum()) > 0 else 1.0
+            pred_bool = pred_slice.astype(bool)
+            gt_bool = gt_slice.astype(bool)
 
-        mdice+=dice
-        miou+=iou
+            intersection = np.logical_and(pred_bool, gt_bool).sum()
+            union = np.logical_or(pred_bool, gt_bool).sum()
+            iou = intersection / union if union > 0 else 1.0
 
-    return mdice/Z, miou/Z
+            denom = pred_bool.sum() + gt_bool.sum()
+            dice = (2 * intersection) / denom if denom > 0 else 1.0
+
+            mdice += dice
+            miou += iou
+
+        dice_scores[class_idx] = mdice / Z if Z > 0 else 0.0
+        iou_scores[class_idx] = miou / Z if Z > 0 else 0.0
+
+    return dice_scores.tolist(), iou_scores.tolist()
 
 def compute_boundary_metrics(pred, gt, spacing):
     pred = pred[0].astype(bool)
