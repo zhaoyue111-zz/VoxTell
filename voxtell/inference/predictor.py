@@ -365,7 +365,8 @@ class VoxTellPredictor:
         valid_output_types = {"binary", "probabilities", "logits"}
         if output_type not in valid_output_types:
             raise ValueError(
-                f"output_type must be one of {sorted(valid_output_types)}, got {output_type}"
+                "output_type must be one of "
+                f"{', '.join(sorted(valid_output_types))}, got {output_type}"
             )
 
         # Preprocess image

@@ -77,7 +77,16 @@ def save_segmentation(
 
 
 def combine_segmentations_argmax(segmentations: np.ndarray, threshold: float) -> np.ndarray:
-    """Combine per-prompt probability maps using argmax with a background threshold."""
+    """
+    Combine per-prompt probability maps using argmax with a background threshold.
+
+    Args:
+        segmentations: Probability array of shape (num_prompts, X, Y, Z) with float values in [0, 1].
+        threshold: Background threshold in [0, 1]; voxels below this max probability are set to 0.
+
+    Returns:
+        Combined label map of shape (X, Y, Z) as uint8, where 0=background and 1..N map to prompts.
+    """
     max_probs = np.max(segmentations, axis=0)
     combined_seg = np.argmax(segmentations, axis=0).astype(np.uint8) + 1
     combined_seg[max_probs < threshold] = 0
@@ -186,7 +195,9 @@ def main() -> int:
     """Main entrypoint function."""
     args = parse_args()
     if not 0.0 <= args.combine_threshold <= 1.0:
-        raise ValueError("--combine-threshold must be between 0 and 1")
+        raise ValueError(
+            f"--combine-threshold must be between 0 and 1, got {args.combine_threshold}"
+        )
 
     # Validate inputs
     input_path = Path(args.input)
