@@ -93,6 +93,22 @@ def combine_segmentations_argmax(segmentations: np.ndarray, threshold: float) ->
     return combined_seg
 
 
+def combine_segmentations_overwrite(segmentations: np.ndarray) -> np.ndarray:
+    """
+    Combine per-prompt binary masks by overwriting later prompts.
+
+    Args:
+        segmentations: Binary mask array of shape (num_prompts, X, Y, Z).
+
+    Returns:
+        Combined label map of shape (X, Y, Z) as uint8, where 0=background and 1..N map to prompts.
+    """
+    combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
+    for i, seg in enumerate(segmentations):
+        combined_seg[seg > 0] = i + 1
+    return combined_seg
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -302,9 +318,7 @@ def main() -> int:
                 # Multiple prompts - create multi-label segmentation
                 # Each prompt gets a different label value (1, 2, 3, ...)
                 # Later prompts overwrite earlier ones in case of overlap
-                combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
-                for i, seg in enumerate(segmentations):
-                    combined_seg[seg > 0] = i + 1
+                combined_seg = combine_segmentations_overwrite(segmentations)
                 save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
                 print("\nLabel mapping:")
                 for i, prompt in enumerate(args.prompts):
@@ -366,9 +380,7 @@ def predict_batch():
             if combine_strategy == "argmax":
                 combined_seg = combine_segmentations_argmax(segmentations, combine_threshold)
             else:
-                combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
-                for i, seg in enumerate(segmentations):
-                    combined_seg[seg > 0] = i + 1
+                combined_seg = combine_segmentations_overwrite(segmentations)
             save_segmentation(combined_seg, output_folder, filename, props, suffix="nii.gz")
 
             gt_path = os.path.join(mask_path, filename)
