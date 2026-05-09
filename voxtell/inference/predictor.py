@@ -339,7 +339,8 @@ class VoxTellPredictor:
     def predict_single_image(
         self,
         data: np.ndarray,
-        text_prompts: Union[str, List[str]]
+        text_prompts: Union[str, List[str]],
+        output_type: str = "binary",
     ) -> np.ndarray:
         """
         Predict segmentation masks for a single image with text prompts.
@@ -353,9 +354,17 @@ class VoxTellPredictor:
                 anatomical structures to segment.
                 
         Returns:
-            Segmentation masks as numpy array of shape (num_prompts, X, Y, Z)
-            with binary values (0 or 1) indicating the segmented regions.
+            Segmentation output as numpy array of shape (num_prompts, X, Y, Z).
+            - output_type="binary": uint8 mask values (0 or 1)
+            - output_type="probabilities": float32 probabilities in [0, 1]
+            - output_type="logits": float32 logits
         """
+
+        valid_output_types = {"binary", "probabilities", "logits"}
+        if output_type not in valid_output_types:
+            raise ValueError(
+                f"output_type must be one of {sorted(valid_output_types)}, got {output_type}"
+            )
 
         # Preprocess image
         data, bbox, orig_shape = self.preprocess(data)
@@ -364,18 +373,23 @@ class VoxTellPredictor:
         embeddings = self.embed_text_prompts(text_prompts)
 
         # Predict segmentation logits
-        prediction = self.predict_sliding_window_return_logits(data, embeddings).to('cpu')
+        prediction = self.predict_sliding_window_return_logits(data, embeddings).to("cpu").float()
 
-        # Postprocess logits to get binary segmentation masks
+        # Postprocess logits to get requested output
         with torch.no_grad():
-            prediction = torch.sigmoid(prediction.float()) > 0.5
+            if output_type == "probabilities":
+                prediction = torch.sigmoid(prediction)
+            elif output_type == "binary":
+                prediction = torch.sigmoid(prediction) > 0.5
         
+        prediction_np = prediction.cpu().numpy()
+        output_dtype = np.uint8 if output_type == "binary" else np.float32
         segmentation_reverted_cropping = np.zeros(
-            [prediction.shape[0], *orig_shape],
-            dtype=np.uint8
+            [prediction_np.shape[0], *orig_shape],
+            dtype=output_dtype,
         )
         segmentation_reverted_cropping = insert_crop_into_image(
-            segmentation_reverted_cropping, prediction, bbox
+            segmentation_reverted_cropping, prediction_np, bbox
         )
 
         return segmentation_reverted_cropping

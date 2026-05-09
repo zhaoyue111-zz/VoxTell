@@ -154,6 +154,13 @@ voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" 
 # ⚠️ WARNING: Overlapping structures will be overwritten by later prompts
 ```
 
+**Save combined multi-label file using argmax across prompts:**
+```bash
+voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" "spleen" --save-combined --combine-strategy argmax --combine-threshold 0.5
+# Output: output_folder/case001.nii.gz (multi-label: 1=liver, 2=spleen)
+# Voxels with max probability below the threshold are set to background (0)
+```
+
 #### CLI Options
 
 | Argument | Short | Required | Description |
@@ -165,6 +172,8 @@ voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" 
 | `--device` | | No | Device to use: `cuda` (default) or `cpu` |
 | `--gpu` | | No | GPU device ID (default: 0) |
 | `--save-combined` | | No | Save multi-label file instead of individual files |
+| `--combine-strategy` | | No | Combine strategy for `--save-combined`: `overwrite` or `argmax` |
+| `--combine-threshold` | | No | Background threshold for `argmax` combine strategy (default: 0.5) |
 | `--verbose` | | No | Enable verbose output |
 
 ---
@@ -195,7 +204,7 @@ predictor = VoxTellPredictor(
 )
 
 # Run prediction
-# Output shape: (num_prompts, x, y, z)
+# Output shape: (num_prompts, x, y, z); output_type defaults to "binary"
 voxtell_seg = predictor.predict_single_image(img, text_prompts)
 ```
 

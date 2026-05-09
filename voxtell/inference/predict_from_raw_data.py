@@ -92,6 +92,9 @@ Examples:
   # Save combined multi-label file (with overlap warning)
   voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" "spleen" --save-combined
 
+  # Save combined multi-label file using argmax across prompts
+  voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" "spleen" --save-combined --combine-strategy argmax --combine-threshold 0.5
+
   # Use CPU
   voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" --device cpu
         """
@@ -144,7 +147,22 @@ Examples:
     parser.add_argument(
         '--save-combined',
         action='store_true',
-        help='Save all prompts in a single multi-label file (WARNING: overlapping structures will be overwritten by later prompts)'
+        help='Save all prompts in a single multi-label file (use --combine-strategy to control overlap handling)'
+    )
+
+    parser.add_argument(
+        '--combine-strategy',
+        type=str,
+        default='overwrite',
+        choices=['overwrite', 'argmax'],
+        help='Combine strategy for --save-combined: overwrite (later prompts overwrite earlier ones) or argmax (highest probability per voxel)'
+    )
+
+    parser.add_argument(
+        '--combine-threshold',
+        type=float,
+        default=0.5,
+        help='Background threshold for argmax combine strategy; voxels with max probability below this are set to 0'
     )
 
     parser.add_argument(
@@ -214,7 +232,12 @@ def main() -> int:
     if args.verbose:
         print("Running prediction...")
 
-    segmentations = predictor.predict_single_image(img, args.prompts)
+    output_type = (
+        "probabilities"
+        if args.save_combined and args.combine_strategy == "argmax"
+        else "binary"
+    )
+    segmentations = predictor.predict_single_image(img, args.prompts, output_type=output_type)
 
     # Save results
     output_folder = Path(args.output)
@@ -232,31 +255,45 @@ def main() -> int:
         suffix = input_path.suffix
 
     if args.save_combined:
-        # Show warning about overlapping structures
-        if len(args.prompts) > 1:
-            print("\n" + "=" * 80)
-            print("WARNING: Saving combined multi-label segmentation.")
-            print("If prompts generate overlapping structures, later prompts will overwrite")
-            print("earlier ones. This may result in loss of segmentation information.")
-            print("Consider using individual file output (default) for overlapping structures.")
-            print("=" * 80 + "\n")
+        if args.combine_strategy == "argmax":
+            if not 0.0 <= args.combine_threshold <= 1.0:
+                raise ValueError("--combine-threshold must be between 0 and 1 for argmax strategy")
 
-        # Save all prompts in a single multi-label file
-        if len(args.prompts) == 1:
-            # Single prompt - save as-is
-            save_segmentation(segmentations[0], output_folder, input_filename, props, suffix=suffix)
-        else:
-            # Multiple prompts - create multi-label segmentation
-            # Each prompt gets a different label value (1, 2, 3, ...)
-            # Later prompts overwrite earlier ones in case of overlap
-            combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
-            for i, seg in enumerate(segmentations):
-                combined_seg[seg > 0] = i + 1
+            if len(args.prompts) == 1:
+                combined_seg = (segmentations[0] >= args.combine_threshold).astype(np.uint8)
+            else:
+                max_probs = np.max(segmentations, axis=0)
+                combined_seg = np.argmax(segmentations, axis=0).astype(np.uint8) + 1
+                combined_seg[max_probs < args.combine_threshold] = 0
+
             save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
+            print(f"\nArgmax combine threshold: {args.combine_threshold}")
+        else:
+            # Show warning about overlapping structures
+            if len(args.prompts) > 1:
+                print("\n" + "=" * 80)
+                print("WARNING: Saving combined multi-label segmentation.")
+                print("If prompts generate overlapping structures, later prompts will overwrite")
+                print("earlier ones. This may result in loss of segmentation information.")
+                print("Consider using individual file output (default) for overlapping structures.")
+                print("=" * 80 + "\n")
 
-            print("\nLabel mapping:")
-            for i, prompt in enumerate(args.prompts):
-                print(f"  {i + 1}: {prompt}")
+            # Save all prompts in a single multi-label file
+            if len(args.prompts) == 1:
+                # Single prompt - save as-is
+                save_segmentation(segmentations[0], output_folder, input_filename, props, suffix=suffix)
+            else:
+                # Multiple prompts - create multi-label segmentation
+                # Each prompt gets a different label value (1, 2, 3, ...)
+                # Later prompts overwrite earlier ones in case of overlap
+                combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
+                for i, seg in enumerate(segmentations):
+                    combined_seg[seg > 0] = i + 1
+                save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
+
+        print("\nLabel mapping:")
+        for i, prompt in enumerate(args.prompts):
+            print(f"  {i + 1}: {prompt}")
     else:
         # Default: Save each prompt as a separate file
         for i, prompt in enumerate(args.prompts):
@@ -278,6 +315,8 @@ def main() -> int:
 def predict_batch():
     prompts = ["spleen", "right_kidney", "left_kidney", "gallbladder", "liver", "stomach", "esophagus",
                "inferior_vena_cava", "pancreas", "duodenum"]
+    combine_strategy = "argmax"
+    combine_threshold = 0.5
     print("\nLabel mapping:")
     for i, prompt in enumerate(prompts):
         print(f"  {i + 1}: {prompt}")
@@ -304,11 +343,19 @@ def predict_batch():
             reader_writer = get_reader_writer(str(image_path))
             img, props = reader_writer.read_images([str(image_path)])  # img:ndarray(P,Z,X,Y) [-1,1]
 
-            segmentations = predictor.predict_single_image(img, prompts)  # ndarray:(P,Z,X,Y) {0，1}
+            output_type = "probabilities" if combine_strategy == "argmax" else "binary"
+            segmentations = predictor.predict_single_image(
+                img, prompts, output_type=output_type
+            )  # ndarray:(P,Z,X,Y)
 
-            combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
-            for i, seg in enumerate(segmentations):
-                combined_seg[seg > 0] = i + 1
+            if combine_strategy == "argmax":
+                max_probs = np.max(segmentations, axis=0)
+                combined_seg = np.argmax(segmentations, axis=0).astype(np.uint8) + 1
+                combined_seg[max_probs < combine_threshold] = 0
+            else:
+                combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
+                for i, seg in enumerate(segmentations):
+                    combined_seg[seg > 0] = i + 1
             save_segmentation(combined_seg, output_folder, filename, props, suffix="nii.gz")
 
             gt_path = os.path.join(mask_path, filename)
