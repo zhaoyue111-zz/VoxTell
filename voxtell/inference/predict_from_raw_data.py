@@ -177,7 +177,6 @@ Examples:
 def main() -> int:
     """Main entrypoint function."""
     args = parse_args()
-
     if not 0.0 <= args.combine_threshold <= 1.0:
         raise ValueError("--combine-threshold must be between 0 and 1")
 

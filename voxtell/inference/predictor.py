@@ -359,7 +359,6 @@ class VoxTellPredictor:
             - output_type="probabilities": float32 probabilities in [0, 1]
             - output_type="logits": float32 logits
         """
-
         valid_output_types = {"binary", "probabilities", "logits"}
         if output_type not in valid_output_types:
             raise ValueError(
