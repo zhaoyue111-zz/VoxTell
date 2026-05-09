@@ -352,6 +352,9 @@ class VoxTellPredictor:
             data: Image data in RAS orientation (3D or 4D with channel dimension).
             text_prompts: Single text prompt or list of text prompts describing
                 anatomical structures to segment.
+            output_type: Output format for masks. "binary" returns uint8 masks,
+                "probabilities" returns sigmoid probabilities, and "logits"
+                returns raw logits.
                 
         Returns:
             Segmentation output as numpy array of shape (num_prompts, X, Y, Z).

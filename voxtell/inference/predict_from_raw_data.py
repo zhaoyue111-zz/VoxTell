@@ -76,6 +76,14 @@ def save_segmentation(
     print(f"Saved segmentation to: {output_file}")
 
 
+def combine_segmentations_argmax(segmentations: np.ndarray, threshold: float) -> np.ndarray:
+    """Combine per-prompt probability maps using argmax with a background threshold."""
+    max_probs = np.max(segmentations, axis=0)
+    combined_seg = np.argmax(segmentations, axis=0).astype(np.uint8) + 1
+    combined_seg[max_probs < threshold] = 0
+    return combined_seg
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -258,13 +266,7 @@ def main() -> int:
 
     if args.save_combined:
         if args.combine_strategy == "argmax":
-            if len(args.prompts) == 1:
-                combined_seg = (segmentations[0] >= args.combine_threshold).astype(np.uint8)
-            else:
-                max_probs = np.max(segmentations, axis=0)
-                combined_seg = np.argmax(segmentations, axis=0).astype(np.uint8) + 1
-                combined_seg[max_probs < args.combine_threshold] = 0
-
+            combined_seg = combine_segmentations_argmax(segmentations, args.combine_threshold)
             save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
             print(f"\nArgmax combine threshold: {args.combine_threshold}")
             if len(args.prompts) > 1:
@@ -351,9 +353,7 @@ def predict_batch():
             )  # ndarray:(P,Z,X,Y)
 
             if combine_strategy == "argmax":
-                max_probs = np.max(segmentations, axis=0)
-                combined_seg = np.argmax(segmentations, axis=0).astype(np.uint8) + 1
-                combined_seg[max_probs < combine_threshold] = 0
+                combined_seg = combine_segmentations_argmax(segmentations, combine_threshold)
             else:
                 combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
                 for i, seg in enumerate(segmentations):
