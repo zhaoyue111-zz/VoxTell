@@ -178,6 +178,9 @@ def main() -> int:
     """Main entrypoint function."""
     args = parse_args()
 
+    if not 0.0 <= args.combine_threshold <= 1.0:
+        raise ValueError("--combine-threshold must be between 0 and 1")
+
     # Validate inputs
     input_path = Path(args.input)
     if not input_path.exists():
@@ -256,9 +259,6 @@ def main() -> int:
 
     if args.save_combined:
         if args.combine_strategy == "argmax":
-            if not 0.0 <= args.combine_threshold <= 1.0:
-                raise ValueError("--combine-threshold must be between 0 and 1 for argmax strategy")
-
             if len(args.prompts) == 1:
                 combined_seg = (segmentations[0] >= args.combine_threshold).astype(np.uint8)
             else:
@@ -291,9 +291,10 @@ def main() -> int:
                     combined_seg[seg > 0] = i + 1
                 save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
 
-        print("\nLabel mapping:")
-        for i, prompt in enumerate(args.prompts):
-            print(f"  {i + 1}: {prompt}")
+        if len(args.prompts) > 1:
+            print("\nLabel mapping:")
+            for i, prompt in enumerate(args.prompts):
+                print(f"  {i + 1}: {prompt}")
     else:
         # Default: Save each prompt as a separate file
         for i, prompt in enumerate(args.prompts):

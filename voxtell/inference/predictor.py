@@ -382,7 +382,7 @@ class VoxTellPredictor:
             elif output_type == "binary":
                 prediction = torch.sigmoid(prediction) > 0.5
         
-        prediction_np = prediction.cpu().numpy()
+        prediction_np = prediction.numpy()
         output_dtype = np.uint8 if output_type == "binary" else np.float32
         segmentation_reverted_cropping = np.zeros(
             [prediction_np.shape[0], *orig_shape],
