@@ -217,7 +217,8 @@ def main() -> int:
 
     if args.save_combined and args.output_type != 'binary':
         print(
-            "Error: --save-combined requires --output-type binary. "
+            "Error: --save-combined requires --output-type binary because "
+            "combined outputs need discrete masks, not probability or logit maps. "
             "Please use --output-type binary or remove --save-combined.",
             file=sys.stderr
         )
@@ -338,7 +339,7 @@ def predict_batch():
                     output_folder,
                     filename,
                     props,
-                    prompt_name=f"prob_map_{prompt}",
+                    prompt_name=f"prob_map--{prompt}",
                     suffix="nii.gz"
                 )
 
