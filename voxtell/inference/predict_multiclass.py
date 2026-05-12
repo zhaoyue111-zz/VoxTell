@@ -339,7 +339,7 @@ def predict_batch():
                     output_folder,
                     filename,
                     props,
-                    prompt_name=f"prob_map--{prompt}",
+                    prompt_name=f"prob_map_{prompt}",
                     suffix="nii.gz"
                 )
 
