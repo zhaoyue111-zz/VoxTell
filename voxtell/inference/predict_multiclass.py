@@ -214,7 +214,11 @@ def main() -> int:
         print(f"Loading VoxTell model from: {model_path}")
 
     if args.save_combined and args.output_type != 'binary':
-        print("Error: --save-combined only supports --output-type binary.", file=sys.stderr)
+        print(
+            "Error: --save-combined requires --output-type binary. "
+            "Please use --output-type binary or remove --save-combined.",
+            file=sys.stderr
+        )
         return 1
 
     predictor = VoxTellPredictor(
