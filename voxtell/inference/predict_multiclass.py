@@ -61,7 +61,7 @@ def save_segmentation(
         output_folder: Output folder path.
         input_filename: Original input filename (without extension).
         properties: Image properties from the reader.
-        prompt_name: Optional prompt name to include in filename.
+        prompt_name: Optional prompt name to include in filename (sanitized for filenames).
         suffix: File extension to use.
     """
     if prompt_name:
