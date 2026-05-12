@@ -21,6 +21,8 @@ from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 from voxtell.inference.predictor_multiclass import VoxTellPredictor
 from voxtell.utils.metrics_multiclass import dice_iou, compute_metrics
 
+BINARY_THRESHOLD = 0.5
+
 
 def get_reader_writer(file_path: str):
     """
@@ -316,7 +318,6 @@ def predict_batch():
     num_classes=len(prompts)
     total_class_dices = np.zeros(num_classes)
     total_class_ious = np.zeros(num_classes)
-    binary_threshold = 0.5
     for filename in os.listdir(input_path):
         if filename.endswith('.nii.gz'):
             image_path = os.path.join(input_path, filename)
@@ -329,7 +330,7 @@ def predict_batch():
                 prompts,
                 output_type="probabilities"
             )  # ndarray:(P,Z,X,Y) [0,1]
-            segmentations = (probabilities > binary_threshold).astype(np.uint8)
+            segmentations = (probabilities > BINARY_THRESHOLD).astype(np.uint8)
 
             for i, prompt in enumerate(prompts):
                 save_segmentation(
@@ -337,7 +338,7 @@ def predict_batch():
                     output_folder,
                     filename,
                     props,
-                    prompt_name=f"{prompt}_probability",
+                    prompt_name=f"{prompt}_prob_map",
                     suffix="nii.gz"
                 )
 
