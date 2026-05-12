@@ -57,7 +57,7 @@ def save_segmentation(
     Save segmentation mask to file.
 
     Args:
-        segmentation: Segmentation array to save.
+        segmentation: Segmentation or probability array to save.
         output_folder: Output folder path.
         input_filename: Original input filename (without extension).
         properties: Image properties from the reader.
@@ -338,7 +338,7 @@ def predict_batch():
                     output_folder,
                     filename,
                     props,
-                    prompt_name=f"{prompt}_prob_map",
+                    prompt_name=f"prob_map_{prompt}",
                     suffix="nii.gz"
                 )
 
