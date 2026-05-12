@@ -127,6 +127,14 @@ Examples:
     )
 
     parser.add_argument(
+        '--output-type',
+        type=str,
+        default='binary',
+        choices=['binary', 'probabilities', 'logits'],
+        help='Output type for predictions: binary, probabilities, or logits'
+    )
+
+    parser.add_argument(
         '--device',
         type=str,
         default='cpu',
@@ -205,6 +213,10 @@ def main() -> int:
         print(f"Text prompts: {args.prompts}")
         print(f"Loading VoxTell model from: {model_path}")
 
+    if args.save_combined and args.output_type != 'binary':
+        print("Error: --save-combined only supports --output-type binary.", file=sys.stderr)
+        return 1
+
     predictor = VoxTellPredictor(
         model_dir=str(model_path),
         device=device
@@ -214,7 +226,11 @@ def main() -> int:
     if args.verbose:
         print("Running prediction...")
 
-    segmentations = predictor.predict_single_image(img, args.prompts)
+    segmentations = predictor.predict_single_image(
+        img,
+        args.prompts,
+        output_type=args.output_type
+    )
 
     # Save results
     output_folder = Path(args.output)
@@ -303,7 +319,22 @@ def predict_batch():
             reader_writer = get_reader_writer(str(image_path))
             img, props = reader_writer.read_images([str(image_path)])  # img:ndarray(P,Z,X,Y) [-1,1]
 
-            segmentations = predictor.predict_single_image(img, prompts)  # ndarray:(P,Z,X,Y) [0，1]
+            probabilities = predictor.predict_single_image(
+                img,
+                prompts,
+                output_type="probabilities"
+            )  # ndarray:(P,Z,X,Y) [0,1]
+            segmentations = (probabilities > 0.5).astype(np.uint8)
+
+            for i, prompt in enumerate(prompts):
+                save_segmentation(
+                    probabilities[i],
+                    output_folder,
+                    filename,
+                    props,
+                    prompt_name=f"{prompt}_prob",
+                    suffix="nii.gz"
+                )
 
             combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8) # [Z,X,Y]
             for i, seg in enumerate(segmentations):
