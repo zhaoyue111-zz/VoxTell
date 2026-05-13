@@ -21,7 +21,7 @@ def apply_contrast_enhancement(image: np.ndarray, factor: float) -> np.ndarray:
     if factor <= 0:
         raise ValueError(f"contrast factor must be > 0, got {factor}")
 
-    image = image.astype(np.float32, copy=False)
+    image = image.astype(np.float32, copy=True)
 
     if image.ndim == 3:
         return _enhance_channel(image, factor)
@@ -61,7 +61,7 @@ def save_reoriented_nifti(image: np.ndarray, output_fname: str, properties: dict
     if original_affine is None or reoriented_affine is None:
         raise ValueError("properties missing original_affine or reoriented_affine for saving")
 
-    image = image.astype(np.float32, copy=False)
+    image = image.astype(np.float32, copy=True)
     image_to_save = _to_nibabel_layout(image)
 
     img_nib = nib.Nifti1Image(image_to_save, affine=reoriented_affine)
