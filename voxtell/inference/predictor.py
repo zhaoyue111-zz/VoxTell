@@ -1,10 +1,12 @@
 import pydoc
+from pathlib import Path
 from queue import Queue
 from threading import Thread
-from typing import List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch._dynamo import OptimizedModule
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
@@ -25,11 +27,11 @@ from voxtell.utils.text_embedding import last_token_pool, wrap_with_instruction
 class VoxTellPredictor:
     """
     Predictor for VoxTell segmentation model.
-    
+
     This class handles loading the VoxTell model, preprocessing images,
     embedding text prompts, and performing sliding window inference to generate
     segmentation masks based on free-text anatomical descriptions.
-    
+
     Attributes:
         device: PyTorch device for inference.
         network: The VoxTell model.
@@ -40,16 +42,17 @@ class VoxTellPredictor:
         perform_everything_on_device: Keep all tensors on device during inference.
         max_text_length: Maximum text prompt length in tokens.
     """
+
     def __init__(self, model_dir: str, device: torch.device = torch.device('cuda'),
                  text_encoding_model: str = 'Qwen/Qwen3-Embedding-4B') -> None:
         """
         Initialize the VoxTell predictor.
-        
+
         Args:
             model_dir: Path to model directory containing plans.json and checkpoint.
             device: PyTorch device to use for inference (default: cuda).
             text_encoding_model: Pretrained text encoding model (Qwen/Qwen3-Embedding-4B).
-            
+
         Raises:
             FileNotFoundError: If model files are not found.
             RuntimeError: If model loading fails.
@@ -94,7 +97,7 @@ class VoxTellPredictor:
 
         # Load weights
         checkpoint = torch.load(
-            join(model_dir, 'fold_0', 'checkpoint_final.pth'),
+            join(model_dir, 'checkpoint_final.pth'),
             map_location=torch.device('cpu'),
             weights_only=False
         )
@@ -103,20 +106,20 @@ class VoxTellPredictor:
             network.load_state_dict(checkpoint['network_weights'])
         else:
             network._orig_mod.load_state_dict(checkpoint['network_weights'])
-        
+
         network.eval()
         self.network = network
 
     def preprocess(self, data: np.ndarray) -> Tuple[torch.Tensor, Tuple, Tuple[int, ...]]:
         """
         Preprocess a single image for inference.
-        
+
         This function preprocesses an image already in RAS orientation by performing
         cropping to non-zero regions and z-score normalization.
-        
+
         Args:
             data: Image data in RAS orientation (3D or 4D with channel dimension).
-            
+
         Returns:
             Tuple containing:
                 - Preprocessed image tensor
@@ -132,14 +135,14 @@ class VoxTellPredictor:
         data = self.normalization.run(data, None)
         data = torch.from_numpy(data)
         return data, bbox, original_shape
-    
+
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]) -> List[Tuple]:
         """
         Generate sliding window slicers for patch-based inference.
-        
+
         Args:
             image_size: Shape of the input image.
-            
+
         Returns:
             List of slice tuples for extracting patches.
         """
@@ -168,18 +171,18 @@ class VoxTellPredictor:
                             tuple([slice(None), *[slice(si, si + ti) for si, ti in
                                                   zip((sx, sy, sz), self.patch_size)]]))
         return slicers
-    
+
     @torch.inference_mode()
     def embed_text_prompts(self, text_prompts: Union[List[str], str]) -> torch.Tensor:
         """
         Embed text prompts into vector representations.
-        
+
         This function converts free-text anatomical descriptions into embeddings
         using the text backbone model.
-        
+
         Args:
             text_prompts: Single text prompt or list of text prompts.
-            
+
         Returns:
             Text embeddings tensor of shape (1, num_prompts, embedding_dim).
         """
@@ -206,20 +209,20 @@ class VoxTellPredictor:
 
     @torch.inference_mode()
     def predict_sliding_window_return_logits(
-        self,
-        input_image: torch.Tensor,
-        text_embeddings: torch.Tensor
+            self,
+            input_image: torch.Tensor,
+            text_embeddings: torch.Tensor
     ) -> torch.Tensor:
         """
         Perform sliding window inference to generate segmentation logits.
-        
+
         Args:
             input_image: Input image tensor of shape (C, X, Y, Z).
             text_embeddings: Text embeddings from embed_text_prompts.
-            
+
         Returns:
             Predicted logits tensor.
-            
+
         Raises:
             ValueError: If input_image is not 4D or not a torch.Tensor.
         """
@@ -229,7 +232,7 @@ class VoxTellPredictor:
             raise ValueError(
                 f"input_image must be 4D (C, X, Y, Z), got shape {input_image.shape}"
             )
-        
+
         self.network = self.network.to(self.device)
 
         empty_cache(self.device)
@@ -249,30 +252,30 @@ class VoxTellPredictor:
             # Revert padding
             predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
         return predicted_logits
-    
+
     @torch.inference_mode()
     def _internal_predict_sliding_window_return_logits(
-        self,
-        data: torch.Tensor,
-        text_embeddings: torch.Tensor,
-        slicers: List[Tuple],
-        do_on_device: bool = True,
+            self,
+            data: torch.Tensor,
+            text_embeddings: torch.Tensor,
+            slicers: List[Tuple],
+            do_on_device: bool = True,
     ) -> torch.Tensor:
         """
         Internal method for sliding window prediction with Gaussian weighting.
-        
+
         Uses a producer-consumer pattern with threading to overlap data loading
         and model inference.
-        
+
         Args:
             data: Preprocessed image data.
             text_embeddings: Text embeddings for prompts.
             slicers: List of slice tuples for patch extraction.
             do_on_device: If True, keep all tensors on GPU during computation.
-            
+
         Returns:
             Aggregated prediction logits.
-            
+
         Raises:
             RuntimeError: If inf values are encountered in predictions.
         """
@@ -298,8 +301,8 @@ class VoxTellPredictor:
 
         # preallocate arrays
         predicted_logits = torch.zeros((text_embeddings.shape[1], *data.shape[1:]),
-                                        dtype=torch.half,
-                                        device=results_device)
+                                       dtype=torch.half,
+                                       device=results_device)
         n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
 
         gaussian = compute_gaussian(
@@ -326,7 +329,7 @@ class VoxTellPredictor:
 
         # Normalize by number of predictions per voxel
         torch.div(predicted_logits, n_predictions, out=predicted_logits)
-        
+
         # Check for inf values
         if torch.any(torch.isinf(predicted_logits)):
             raise RuntimeError(
@@ -337,21 +340,21 @@ class VoxTellPredictor:
         return predicted_logits
 
     def predict_single_image(
-        self,
-        data: np.ndarray,
-        text_prompts: Union[str, List[str]]
+            self,
+            data: np.ndarray,
+            text_prompts: Union[str, List[str]]
     ) -> np.ndarray:
         """
         Predict segmentation masks for a single image with text prompts.
-        
+
         This is the main prediction method that orchestrates preprocessing,
         text embedding, sliding window inference, and postprocessing.
-        
+
         Args:
             data: Image data in RAS orientation (3D or 4D with channel dimension).
             text_prompts: Single text prompt or list of text prompts describing
                 anatomical structures to segment.
-                
+
         Returns:
             Segmentation masks as numpy array of shape (num_prompts, X, Y, Z)
             with binary values (0 or 1) indicating the segmented regions.
@@ -369,7 +372,7 @@ class VoxTellPredictor:
         # Postprocess logits to get binary segmentation masks
         with torch.no_grad():
             prediction = torch.sigmoid(prediction.float()) > 0.5
-        
+
         segmentation_reverted_cropping = np.zeros(
             [prediction.shape[0], *orig_shape],
             dtype=np.uint8
@@ -380,6 +383,199 @@ class VoxTellPredictor:
 
         return segmentation_reverted_cropping
 
+    @torch.inference_mode()
+    def predict_single_image_with_alignment(
+            self,
+            data: np.ndarray,
+            text_prompts: Union[str, List[str]],
+            tsne_output: Optional[Union[str, Path]] = None
+    ) -> Tuple[np.ndarray, Dict[str, Union[np.ndarray, List[int], Optional[str]]]]:
+        """
+        Predict segmentation masks and compute text-vision alignment metrics.
+
+        Args:
+            data: Image data in RAS orientation (3D or 4D with channel dimension).
+            text_prompts: Single text prompt or list of text prompts describing
+                anatomical structures to segment.
+            tsne_output: Optional file path to save a t-SNE visualization of prompt
+                and foreground vision embeddings.
+
+        Returns:
+            Tuple containing:
+                - Segmentation masks as numpy array of shape (num_prompts, X, Y, Z)
+                - Alignment metrics dictionary with prompt similarities and
+                  prompt-to-vision similarities.
+        """
+        if isinstance(text_prompts, str):
+            text_prompts = [text_prompts]
+
+        # Preprocess image
+        data, bbox, orig_shape = self.preprocess(data)
+
+        # Embed text prompts
+        text_embeddings = self.embed_text_prompts(text_prompts)
+
+        # Predict segmentation logits
+        predicted_logits = self.predict_sliding_window_return_logits(data, text_embeddings)
+
+        # Postprocess logits to get binary segmentation masks
+        segmentation = torch.sigmoid(predicted_logits.float()) > 0.5
+
+        alignment = self._compute_alignment_metrics(
+            data=data,
+            text_embeddings=text_embeddings,
+            segmentation=segmentation,
+            text_prompts=text_prompts,
+            tsne_output=tsne_output,
+        )
+
+        segmentation_cpu = segmentation.to('cpu')
+        segmentation_reverted_cropping = np.zeros(
+            [segmentation_cpu.shape[0], *orig_shape],
+            dtype=np.uint8
+        )
+        segmentation_reverted_cropping = insert_crop_into_image(
+            segmentation_reverted_cropping, segmentation_cpu, bbox
+        )
+
+        return segmentation_reverted_cropping, alignment
+
+    @torch.inference_mode()
+    def _compute_alignment_metrics(
+            self,
+            data: torch.Tensor,
+            text_embeddings: torch.Tensor,
+            segmentation: torch.Tensor,
+            text_prompts: List[str],
+            tsne_output: Optional[Union[str, Path]] = None
+    ) -> Dict[str, Union[np.ndarray, List[int], Optional[str]]]:
+        """
+        Compute prompt similarity and prompt-to-vision alignment metrics.
+        """
+        self.network = self.network.to(self.device)
+        data_device = data.to(self.device)
+        text_embeddings = text_embeddings.to(self.device)
+        segmentation = segmentation.to(self.device)
+
+        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            skips = self.network.encoder(data_device[None])
+            selected_feature = skips[self.network.selected_decoder_layer]
+            vision_embedding = selected_feature.permute(0, 2, 3, 4, 1)
+            vision_embedding = self.network.project_bottleneck_embed(vision_embedding)
+
+            prompt_proj = text_embeddings.permute(1, 0, 2)
+            prompt_proj = self.network.project_text_embed(prompt_proj)
+            prompt_proj = prompt_proj.permute(1, 0, 2)
+
+        prompt_raw = text_embeddings.squeeze(0)
+        prompt_raw_norm = F.normalize(prompt_raw, dim=-1)
+        prompt_similarity = prompt_raw_norm @ prompt_raw_norm.T
+
+        target_size = vision_embedding.shape[1:4]
+        mask_downsampled = F.interpolate(
+            segmentation.float().unsqueeze(1),
+            size=target_size,
+            mode='nearest'
+        )
+        mask_flat = mask_downsampled[:, 0].reshape(segmentation.shape[0], -1)
+        vision_flat = vision_embedding[0].reshape(-1, vision_embedding.shape[-1])
+
+        prompt_proj_norm = F.normalize(prompt_proj[0], dim=-1)
+        region_embeddings = []
+        prompt_vision_similarity = []
+        for prompt_idx in range(mask_flat.shape[0]):
+            weights = mask_flat[prompt_idx]
+            weight_sum = weights.sum()
+            if weight_sum > 0:
+                region_embed = (weights.unsqueeze(1) * vision_flat).sum(dim=0) / weight_sum
+                region_embed_norm = F.normalize(region_embed, dim=0)
+                similarity = F.cosine_similarity(
+                    prompt_proj_norm[prompt_idx],
+                    region_embed_norm,
+                    dim=0
+                ).item()
+            else:
+                region_embed = torch.zeros(vision_flat.shape[-1], device=vision_flat.device)
+                similarity = float('nan')
+            region_embeddings.append(region_embed)
+            prompt_vision_similarity.append(similarity)
+
+        foreground_voxels = segmentation.sum(dim=(1, 2, 3)).to('cpu').to(torch.int64).numpy().tolist()
+
+        tsne_path = None
+        if tsne_output is not None:
+            tsne_path = self._plot_tsne(
+                prompt_embeddings=prompt_proj[0],
+                vision_embeddings=torch.stack(region_embeddings, dim=0),
+                text_prompts=text_prompts,
+                output_path=tsne_output
+            )
+
+        empty_cache(self.device)
+
+        return {
+            "prompt_similarity": prompt_similarity.to('cpu').numpy(),
+            "prompt_vision_similarity": np.array(prompt_vision_similarity, dtype=np.float32),
+            "foreground_voxels": foreground_voxels,
+            "tsne_path": tsne_path,
+        }
+
+    @staticmethod
+    def _plot_tsne(
+            prompt_embeddings: torch.Tensor,
+            vision_embeddings: torch.Tensor,
+            text_prompts: List[str],
+            output_path: Union[str, Path]
+    ) -> str:
+        try:
+            from sklearn.manifold import TSNE
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise ImportError(
+                "t-SNE plotting requires scikit-learn and matplotlib. "
+                "Install them with `pip install scikit-learn matplotlib`."
+            ) from exc
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        prompt_embeddings = prompt_embeddings.detach().cpu().numpy()
+        vision_embeddings = vision_embeddings.detach().cpu().numpy()
+        embeddings = np.vstack([prompt_embeddings, vision_embeddings])
+        n_samples = embeddings.shape[0]
+        if n_samples < 2:
+            raise ValueError("t-SNE requires at least 2 samples.")
+
+        perplexity = min(30, max(5, (n_samples - 1) // 3))
+        if perplexity >= n_samples:
+            perplexity = max(1, n_samples - 1)
+
+        tsne = TSNE(n_components=2, init="random", learning_rate="auto", perplexity=perplexity)
+        coords = tsne.fit_transform(embeddings)
+
+        num_prompts = len(text_prompts)
+        colors = plt.cm.tab10(np.linspace(0, 1, max(num_prompts, 1)))
+        plt.figure(figsize=(8, 6))
+
+        for idx, prompt in enumerate(text_prompts):
+            prompt_coord = coords[idx]
+            vision_coord = coords[idx + num_prompts]
+            color = colors[idx % len(colors)]
+            plt.scatter(prompt_coord[0], prompt_coord[1], color=color, marker='o', label=f"text: {prompt}")
+            plt.scatter(vision_coord[0], vision_coord[1], color=color, marker='s', label=f"vision: {prompt}")
+            plt.annotate(prompt, prompt_coord, textcoords="offset points", xytext=(4, 4), fontsize=8)
+
+        plt.title("t-SNE: Prompt vs Foreground Vision Embeddings")
+        plt.xlabel("t-SNE 1")
+        plt.ylabel("t-SNE 2")
+        plt.legend(fontsize=7, loc="best", ncol=2)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=200)
+        plt.close()
+
+        return str(output_path)
+
+
 if __name__ == '__main__':
     from pathlib import Path
     from nnunetv2.imageio.nibabel_reader_writer import NibabelIOWithReorient
@@ -387,22 +583,23 @@ if __name__ == '__main__':
     # Default paths - modify these as needed
     DEFAULT_IMAGE_PATH = "/path/to/your/image.nii.gz"
     DEFAULT_MODEL_DIR = "/path/to/your/model/directory"
-    
+
     # Configuration
     image_path = DEFAULT_IMAGE_PATH
     model_dir = DEFAULT_MODEL_DIR
     text_prompts = ["liver", "right kidney", "left kidney", "spleen"]
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    
+
     # Load image
     img, props = NibabelIOWithReorient().read_images([image_path])
-    
+
     # Initialize predictor and run inference
     predictor = VoxTellPredictor(model_dir=model_dir, device=device)
     voxtell_seg = predictor.predict_single_image(img, text_prompts)
-    
+
     # Visualize results, we reccommend using napari for 3D visualization
     import napari
+
     viewer = napari.Viewer()
     viewer.add_image(img, name='image')
     for i, prompt in enumerate(text_prompts):
