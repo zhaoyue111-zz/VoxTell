@@ -165,6 +165,7 @@ voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" 
 | `--device` | | No | Device to use: `cuda` (default) or `cpu` |
 | `--gpu` | | No | GPU device ID (default: 0) |
 | `--save-combined` | | No | Save multi-label file instead of individual files |
+| `--contrast-factor` | | No | Apply contrast enhancement before inference (1.0 = no change). Augmented image is saved to the output folder when used |
 | `--verbose` | | No | Enable verbose output |
 
 ---

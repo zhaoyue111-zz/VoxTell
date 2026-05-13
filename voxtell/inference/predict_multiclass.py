@@ -19,6 +19,7 @@ from nnunetv2.imageio.nibabel_reader_writer import NibabelIOWithReorient
 from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 
 from voxtell.inference.predictor_multiclass import VoxTellPredictor
+from voxtell.utils.image_augmentation import apply_contrast_enhancement, save_reoriented_nifti
 from voxtell.utils.metrics_multiclass import dice_iou, compute_metrics
 
 BINARY_THRESHOLD = 0.5
@@ -163,6 +164,17 @@ Examples:
         help='Enable verbose output'
     )
 
+    parser.add_argument(
+        '--contrast-factor',
+        type=float,
+        default=1.0,
+        help=(
+            'Apply contrast enhancement before inference. '
+            'Use 1.0 to keep the image unchanged. '
+            'Augmented images are saved to the output folder when this value differs from 1.0.'
+        )
+    )
+
     return parser.parse_args()
 
 
@@ -210,8 +222,33 @@ def main() -> int:
         print(f"Error loading image: {e}", file=sys.stderr)
         return 1
 
+    # Prepare output folder and filename metadata
+    output_folder = Path(args.output)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    # Get input filename without extension
+    input_filename = input_path.stem
+    if input_filename.endswith('.nii'):
+        input_filename = input_filename[:-4]
+
+    # Determine file suffix from input
+    if input_path.suffix == '.gz' and input_path.stem.endswith('.nii'):
+        suffix = '.nii.gz'
+    else:
+        suffix = input_path.suffix
+
+    augmented_img = img
+    if args.contrast_factor != 1.0:
+        if args.verbose:
+            print(f"Applying contrast enhancement (factor={args.contrast_factor})")
+        augmented_img = apply_contrast_enhancement(img, args.contrast_factor)
+        augmented_tag = f"contrast{args.contrast_factor:g}"
+        augmented_path = output_folder / f"{input_filename}_{augmented_tag}{suffix}"
+        save_reoriented_nifti(augmented_img, str(augmented_path), props)
+        print(f"Saved augmented image to: {augmented_path}")
+
     if args.verbose:
-        print(f"Image shape: {img.shape}")
+        print(f"Image shape: {augmented_img.shape}")
         print(f"Text prompts: {args.prompts}")
         print(f"Loading VoxTell model from: {model_path}")
 
@@ -234,25 +271,10 @@ def main() -> int:
         print("Running prediction...")
 
     segmentations = predictor.predict_single_image(
-        img,
+        augmented_img,
         args.prompts,
         output_type=args.output_type
     )
-
-    # Save results
-    output_folder = Path(args.output)
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    # Get input filename without extension
-    input_filename = input_path.stem
-    if input_filename.endswith('.nii'):
-        input_filename = input_filename[:-4]
-
-    # Determine file suffix from input
-    if input_path.suffix == '.gz' and input_path.stem.endswith('.nii'):
-        suffix = '.nii.gz'
-    else:
-        suffix = input_path.suffix
 
     if args.save_combined:
         # Show warning about overlapping structures
