@@ -10,7 +10,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -155,6 +155,25 @@ Examples:
     )
 
     parser.add_argument(
+        '--alignment',
+        action='store_true',
+        help='Compute prompt similarity and prompt-to-vision alignment metrics'
+    )
+
+    parser.add_argument(
+        '--tsne',
+        action='store_true',
+        help='Save t-SNE plot of prompt and foreground vision embeddings (requires scikit-learn and matplotlib)'
+    )
+
+    parser.add_argument(
+        '--tsne-output',
+        type=str,
+        default=None,
+        help='Output path for the t-SNE plot (default: <output>/<case>_tsne.png)'
+    )
+
+    parser.add_argument(
         '--contrast-factor',
         type=float,
         default=1.0,
@@ -166,6 +185,27 @@ Examples:
     )
 
     return parser.parse_args()
+
+
+def format_alignment_output(
+    prompts: List[str],
+    prompt_similarity: np.ndarray,
+    prompt_vision_similarity: np.ndarray,
+    foreground_voxels: List[int],
+    tsne_path: Optional[str]
+) -> str:
+    lines = []
+    lines.append("\nPrompt order:")
+    lines.append("  " + ", ".join(prompts))
+    lines.append("\nPrompt embedding cosine similarity matrix:")
+    lines.append(np.array2string(prompt_similarity, precision=4, floatmode="fixed"))
+    lines.append("\nForeground vision embedding vs prompt cosine similarity:")
+    for prompt, similarity, voxels in zip(prompts, prompt_vision_similarity, foreground_voxels):
+        similarity_str = "nan" if np.isnan(similarity) else f"{similarity:.4f}"
+        lines.append(f"  {prompt}: {similarity_str} (foreground voxels: {voxels})")
+    if tsne_path:
+        lines.append(f"\nSaved t-SNE plot to: {tsne_path}")
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -251,7 +291,27 @@ def main() -> int:
     if args.verbose:
         print("Running prediction...")
 
-    segmentations = predictor.predict_single_image(augmented_img, args.prompts)
+    run_alignment = args.alignment or args.tsne
+    alignment_output: Optional[Tuple[np.ndarray, np.ndarray, List[int], Optional[str]]] = None
+    if run_alignment:
+        tsne_output = None
+        if args.tsne:
+            tsne_output = args.tsne_output
+            if tsne_output is None:
+                tsne_output = str(output_folder / f"{input_filename}_tsne.png")
+        segmentations, alignment = predictor.predict_single_image_with_alignment(
+            augmented_img,
+            args.prompts,
+            tsne_output=tsne_output
+        )
+        alignment_output = (
+            alignment["prompt_similarity"],
+            alignment["prompt_vision_similarity"],
+            alignment["foreground_voxels"],
+            alignment["tsne_path"],
+        )
+    else:
+        segmentations = predictor.predict_single_image(augmented_img, args.prompts)
 
     if args.save_combined:
         # Show warning about overlapping structures
@@ -290,6 +350,18 @@ def main() -> int:
                 prompt_name=prompt,
                 suffix=suffix
             )
+
+    if alignment_output is not None:
+        prompt_similarity, prompt_vision_similarity, foreground_voxels, tsne_path = alignment_output
+        print(
+            format_alignment_output(
+                args.prompts,
+                prompt_similarity,
+                prompt_vision_similarity,
+                foreground_voxels,
+                tsne_path
+            )
+        )
 
     if args.verbose:
         print("\nPrediction completed successfully!")
