@@ -10,7 +10,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -101,21 +101,21 @@ Examples:
     parser.add_argument(
         '-i', '--input',
         type=str,
-        required=True,
+        default="/data/data4/CT_MRI_DATA_3D/images/Delay/FNH_PA10.nii.gz",
         help='Path to input image file (NIfTI format recommended)'
     )
 
     parser.add_argument(
         '-o', '--output',
         type=str,
-        required=True,
+        default="out",
         help='Path to output folder where segmentation files will be saved'
     )
 
     parser.add_argument(
         '-m', '--model',
         type=str,
-        required=True,
+        default="/data/data4/VoxTell/model",
         help='Path to VoxTell model directory containing plans.json and fold_0/'
     )
 
@@ -123,7 +123,6 @@ Examples:
         '-p', '--prompts',
         type=str,
         nargs='+',
-        required=True,
         help='Text prompt(s) for segmentation (e.g., "liver" "spleen" "tumor")'
     )
 
@@ -155,17 +154,47 @@ Examples:
     )
 
     parser.add_argument(
-        '--contrast-factor',
-        type=float,
-        default=1.0,
-        help=(
-            'Apply contrast enhancement before inference. '
-            'Use 1.0 to keep the image unchanged. '
-            'Augmented images are saved to the output folder when this value differs from 1.0.'
-        )
+        '--alignment',
+        action='store_true',
+        help='Compute prompt similarity and prompt-to-vision alignment metrics'
+    )
+
+    parser.add_argument(
+        '--tsne',
+        action='store_true',
+        help='Save t-SNE plot of prompt and foreground vision embeddings (requires scikit-learn and matplotlib)'
+    )
+
+    parser.add_argument(
+        '--tsne-output',
+        type=str,
+        default="out",
+        help='Output path for the t-SNE plot (default: <output>/<case>_tsne.png)'
     )
 
     return parser.parse_args()
+
+
+
+def format_alignment_output(
+    prompts: List[str],
+    prompt_similarity: np.ndarray,
+    prompt_vision_similarity: np.ndarray,
+    foreground_voxels: List[int],
+    tsne_path: Optional[str]
+) -> str:
+    lines = []
+    lines.append("\nPrompt order:")
+    lines.append("  " + ", ".join(prompts))
+    lines.append("\nPrompt embedding cosine similarity matrix:")
+    lines.append(np.array2string(prompt_similarity, precision=4, floatmode="fixed"))
+    lines.append("\nForeground vision embedding vs prompt cosine similarity:")
+    for prompt, similarity, voxels in zip(prompts, prompt_vision_similarity, foreground_voxels):
+        similarity_str = "nan" if np.isnan(similarity) else f"{similarity:.4f}"
+        lines.append(f"  {prompt}: {similarity_str} (foreground voxels: {voxels})")
+    if tsne_path:
+        lines.append(f"\nSaved t-SNE plot to: {tsne_path}")
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -184,7 +213,7 @@ def main() -> int:
     if not (model_path / 'plans.json').exists():
         raise FileNotFoundError(f"plans.json not found in model directory: {model_path}")
 
-    if not (model_path / 'fold_0' / 'checkpoint_final.pth').exists():
+    if not (model_path / 'checkpoint_final.pth').exists():
         raise FileNotFoundError(f"checkpoint_final.pth not found in {model_path / 'fold_0'}")
 
     # Setup device
@@ -227,18 +256,8 @@ def main() -> int:
     else:
         suffix = input_path.suffix
 
-    augmented_img = img
-    if args.contrast_factor != 1.0:
-        if args.verbose:
-            print(f"Applying contrast enhancement (factor={args.contrast_factor})")
-        augmented_img = apply_contrast_enhancement(img, args.contrast_factor)
-        augmented_tag = f"contrast{args.contrast_factor:g}"
-        augmented_path = output_folder / f"{input_filename}_{augmented_tag}{suffix}"
-        save_reoriented_nifti(augmented_img, str(augmented_path), props)
-        print(f"Saved augmented image to: {augmented_path}")
-
     if args.verbose:
-        print(f"Image shape: {augmented_img.shape}")
+        print(f"Image shape: {img.shape}")
         print(f"Text prompts: {args.prompts}")
         print(f"Loading VoxTell model from: {model_path}")
 
@@ -247,11 +266,44 @@ def main() -> int:
         device=device
     )
 
+    args.prompts = ["spleen",
+                   "right_kidney",
+                   "left_kidney",
+                   "gallbladder",
+                   "liver",
+                   "stomach",
+                   "esophagus",
+                   "inferior_vena_cava",
+                   "pancreas",
+                   "duodenum",
+                   "aorta"]
+
     # Run prediction
     if args.verbose:
         print("Running prediction...")
 
-    segmentations = predictor.predict_single_image(augmented_img, args.prompts)
+    run_alignment = args.alignment or args.tsne
+    alignment_output: Optional[Tuple[np.ndarray, np.ndarray, List[int], Optional[str]]] = None
+    if run_alignment:
+        tsne_output = None
+        if args.tsne:
+            tsne_output = args.tsne_output
+            if tsne_output is None:
+                tsne_output = str(output_folder / f"{input_filename}_tsne.png")
+        segmentations, alignment = predictor.predict_single_image_with_alignment(
+            img,
+            args.prompts,
+            tsne_output=tsne_output
+        )
+        alignment_output = (
+            alignment["prompt_similarity"],
+            alignment["prompt_vision_similarity"],
+            alignment["foreground_voxels"],
+            alignment["tsne_path"],
+        )
+    else:
+        segmentations = predictor.predict_single_image(img, args.prompts)
+
 
     if args.save_combined:
         # Show warning about overlapping structures
@@ -290,6 +342,18 @@ def main() -> int:
                 prompt_name=prompt,
                 suffix=suffix
             )
+
+    if alignment_output is not None:
+        prompt_similarity, prompt_vision_similarity, foreground_voxels, tsne_path = alignment_output
+        print(
+            format_alignment_output(
+                args.prompts,
+                prompt_similarity,
+                prompt_vision_similarity,
+                foreground_voxels,
+                tsne_path
+            )
+        )
 
     if args.verbose:
         print("\nPrediction completed successfully!")
@@ -357,4 +421,4 @@ def predict_batch():
 
 if __name__ == '__main__':
     os.environ['HF_HUB_OFFLINE'] = '1'
-    predict_batch()
+    main()
