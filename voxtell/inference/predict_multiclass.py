@@ -7,6 +7,7 @@ with free-text prompts.
 """
 
 import argparse
+import gc
 import os
 import sys
 from pathlib import Path
@@ -21,8 +22,6 @@ from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 from voxtell.inference.predictor_multiclass import VoxTellPredictor
 from voxtell.utils.image_augmentation import apply_contrast_enhancement, save_reoriented_nifti
 from voxtell.utils.metrics_multiclass import dice_iou, compute_metrics
-
-BINARY_THRESHOLD = 0.5
 
 
 def get_reader_writer(file_path: str):
@@ -58,11 +57,11 @@ def save_segmentation(
     Save segmentation mask to file.
 
     Args:
-        segmentation: Segmentation or probability array to save.
+        segmentation: Segmentation array to save.
         output_folder: Output folder path.
         input_filename: Original input filename (without extension).
         properties: Image properties from the reader.
-        prompt_name: Optional prompt name to include in filename (sanitized for filenames).
+        prompt_name: Optional prompt name to include in filename.
         suffix: File extension to use.
     """
     if prompt_name:
@@ -103,21 +102,21 @@ Examples:
     parser.add_argument(
         '-i', '--input',
         type=str,
-        required=True,
+        default="/data/data4/CT_MRI_DATA_3D/images/Delay/FNH_PA10.nii.gz",
         help='Path to input image file (NIfTI format recommended)'
     )
 
     parser.add_argument(
         '-o', '--output',
         type=str,
-        required=True,
+        default="out_augmented",
         help='Path to output folder where segmentation files will be saved'
     )
 
     parser.add_argument(
         '-m', '--model',
         type=str,
-        default="D:\\pythonCode\\VoxTell\\model",
+        default="/data/data4/VoxTell/model",
         help='Path to VoxTell model directory containing plans.json and fold_0/'
     )
 
@@ -125,14 +124,13 @@ Examples:
         '-p', '--prompts',
         type=str,
         nargs='+',
-        required=True,
         help='Text prompt(s) for segmentation (e.g., "liver" "spleen" "tumor")'
     )
 
     parser.add_argument(
         '--output-type',
         type=str,
-        default='binary',
+        default='probabilities',
         choices=['binary', 'probabilities', 'logits'],
         help='Output type for predictions: binary, probabilities, or logits'
     )
@@ -140,7 +138,7 @@ Examples:
     parser.add_argument(
         '--device',
         type=str,
-        default='cpu',
+        default='cuda',
         choices=['cuda', 'cpu'],
         help='Device to use for inference (default: cuda)'
     )
@@ -270,72 +268,99 @@ def main() -> int:
     if args.verbose:
         print("Running prediction...")
 
+    args.prompts = ["spleen", "right_kidney", "left_kidney", "gallbladder", "liver", "stomach", "esophagus",
+               "inferior_vena_cava", "pancreas", "duodenum", "aorta"]
     segmentations = predictor.predict_single_image(
         augmented_img,
         args.prompts,
         output_type=args.output_type
     )
+    print(segmentations.shape)
+    for i in range(segmentations.shape[0]):
+        print(segmentations[i][46, 182, 225])
 
-    if args.save_combined:
-        # Show warning about overlapping structures
-        if len(args.prompts) > 1:
-            print("\n" + "=" * 80)
-            print("WARNING: Saving combined multi-label segmentation.")
-            print("If prompts generate overlapping structures, later prompts will overwrite")
-            print("earlier ones. This may result in loss of segmentation information.")
-            print("Consider using individual file output (default) for overlapping structures.")
-            print("=" * 80 + "\n")
+    # Show warning about overlapping structures
+    if len(args.prompts) > 1:
+        print("\n" + "=" * 80)
+        print("WARNING: Saving combined multi-label segmentation.")
+        print("If prompts generate overlapping structures, later prompts will overwrite")
+        print("earlier ones. This may result in loss of segmentation information.")
+        print("Consider using individual file output (default) for overlapping structures.")
+        print("=" * 80 + "\n")
 
-        # Save all prompts in a single multi-label file
-        if len(args.prompts) == 1:
-            # Single prompt - save as-is
-            save_segmentation(segmentations[0], output_folder, input_filename, props, suffix=suffix)
-        else:
-            # Multiple prompts - create multi-label segmentation
-            # Each prompt gets a different label value (1, 2, 3, ...)
-            # Later prompts overwrite earlier ones in case of overlap
-            combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
-            for i, seg in enumerate(segmentations):
-                combined_seg[seg > 0] = i + 1
-            save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
-
-            print("\nLabel mapping:")
-            for i, prompt in enumerate(args.prompts):
-                print(f"  {i + 1}: {prompt}")
+    # Save all prompts in a single multi-label file
+    if len(args.prompts) == 1:
+        # Single prompt - save as-is
+        save_segmentation(segmentations[0], output_folder, input_filename, props, suffix=suffix)
     else:
-        # Default: Save each prompt as a separate file
+        # Multiple prompts - create multi-label segmentation
+        # Each prompt gets a different label value (1, 2, 3, ...)
+        # Later prompts overwrite earlier ones in case of overlap
+        combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
+        for i, seg in enumerate(segmentations):
+            combined_seg[seg > 0] = i + 1
+        save_segmentation(combined_seg, output_folder, input_filename, props, suffix=suffix)
+
+        gt_path = args.input.replace("images","labels")
+        gt, _ = reader_writer.read_images([str(gt_path)])  # ndarray:(P,Z,X,Y)
+
+        # dice,iou=dice_iou(segmentations,gt)
+        # combined_seg=np.expand_dims(combined_seg,axis=0) # [1,Z,X,Y]
+        gt_3d = gt[0]
+        num_classes = len(args.prompts)
+        gt_one_hot = np.zeros((num_classes, *gt_3d.shape), dtype=np.uint8)  # [P,Z,X,Y]
+        for i in range(num_classes):
+            gt_one_hot[i][gt_3d == (i + 1)] = 1
+        dice, iou = compute_metrics(segmentations, gt_one_hot)
+        print(f"\nResults for {input_filename}:")
+        for i, name in enumerate(args.prompts):
+            print(f"  {name:20s}: Dice {dice[i]:.4f}, IoU {iou[i]:.4f}")
+
+        print("\nLabel mapping:")
         for i, prompt in enumerate(args.prompts):
-            save_segmentation(
-                segmentations[i],
-                output_folder,
-                input_filename,
-                props,
-                prompt_name=prompt,
-                suffix=suffix
-            )
+            print(f"  {i + 1}: {prompt}")
+    # else:
+    #     # Default: Save each prompt as a separate file
+    #     for i, prompt in enumerate(args.prompts):
+    #         save_segmentation(
+    #             segmentations[i],
+    #             output_folder,
+    #             input_filename,
+    #             props,
+    #             prompt_name=prompt,
+    #             suffix=suffix
+    #         )
 
     if args.verbose:
         print("\nPrediction completed successfully!")
 
     return 0
 
-
 def predict_batch():
-    prompts = ["spleen", "right_kidney", "left_kidney", "gallbladder", "liver", "stomach", "esophagus",
-               "inferior_vena_cava", "pancreas", "duodenum", "aorta"]
+    prompts = ["spleen",
+               "right_kidney",
+               "left_kidney",
+               "gallbladder",
+               "liver",
+               "stomach",
+               "esophagus",
+               "inferior_vena_cava",
+               "pancreas",
+               "duodenum",
+               "aorta"]
     print("\nLabel mapping:")
     for i, prompt in enumerate(prompts):  # 如果要combined segmentations，需要标签和和提示引引齐齐
         print(f"  {i + 1}: {prompt}")
 
-    device = torch.device(f'cpu')
-    model_path = Path("D:\\pythonCode\\VoxTell\\model")
+    device = torch.device(f'cuda:0')
+    model_path = Path("/data/data4/VoxTell/model")
     predictor = VoxTellPredictor(model_dir=str(model_path), device=device)
 
     output_folder = Path("./out_multi/Delay")
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    input_path = Path("D:\\dataset\\CT_MRI_DATA_3D\\images\\Delay")
-    mask_path = Path("D:\\dataset\\CT_MRI_DATA_3D\\labels\\Delay")
+    input_path = Path("/data/data4/CT_MRI_DATA_3D/images/Delay")
+    mask_path = Path("/data/data4/CT_MRI_DATA_3D/labels/Delay")
     num = sum(1 for f in os.listdir(input_path) if f.endswith(".nii.gz"))
 
     num_classes=len(prompts)
@@ -348,22 +373,28 @@ def predict_batch():
             reader_writer = get_reader_writer(str(image_path))
             img, props = reader_writer.read_images([str(image_path)])  # img:ndarray(P,Z,X,Y) [-1,1]
 
-            probabilities = predictor.predict_single_image(
-                img,
-                prompts,
-                output_type="probabilities"
-            )  # ndarray:(P,Z,X,Y) [0,1]
-            segmentations = (probabilities > BINARY_THRESHOLD).astype(np.uint8)
+            # contrast_factor=0.5
+            # augmented_img = apply_contrast_enhancement(img, contrast_factor)
+            # augmented_tag = f"contrast{contrast_factor:g}"
+            # augmented_path = output_folder / f"{filename}_{augmented_tag}.nii.gz"
+            # save_reoriented_nifti(augmented_img, str(augmented_path), props)
+            # print(f"Saved augmented image to: {augmented_path}")
+
+            segmentations = predictor.predict_single_image(img, prompts)  # ndarray:(P,Z,X,Y) [0，1]
 
             for i, prompt in enumerate(prompts):
                 save_segmentation(
-                    probabilities[i],
-                    output_folder,
-                    filename,
-                    props,
-                    prompt_name=f"prob_map_{prompt}",
-                    suffix="nii.gz"
-                )
+                            segmentations[i],
+                            output_folder,
+                            filename[:-7],
+                            props,
+                            prompt_name=prompt,
+                            suffix=".nii.gz"
+                        )
+
+            # print(segmentations.shape)
+            # for i in range(segmentations.shape[0]):
+            #     print(segmentations[i][46,182,225])
 
             combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8) # [Z,X,Y]
             for i, seg in enumerate(segmentations):
@@ -388,6 +419,10 @@ def predict_batch():
             total_class_dices += np.array(dice)
             total_class_ious += np.array(iou)
 
+            del segmentations  # 删除占用显存的大张量
+            gc.collect()
+            torch.cuda.empty_cache()
+
     mean_class_dices = total_class_dices / num
     mean_class_ious = total_class_ious / num
 
@@ -407,3 +442,4 @@ def predict_batch():
 if __name__ == '__main__':
     os.environ['HF_HUB_OFFLINE'] = '1'
     predict_batch()
+    # main()
