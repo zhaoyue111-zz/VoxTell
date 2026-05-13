@@ -167,12 +167,6 @@ voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" 
 | `--save-combined` | | No | Save multi-label file instead of individual files |
 | `--contrast-factor` | | No | Apply contrast enhancement before inference (1.0 = no change). Augmented image is saved to the output folder when used |
 | `--verbose` | | No | Enable verbose output |
-| `--alignment` | | No | Print prompt similarity matrix and prompt-to-foreground vision similarity |
-| `--tsne` | | No | Save a t-SNE plot of prompt vs foreground vision embeddings |
-| `--tsne-output` | | No | Output path for the t-SNE plot (default: `<output>/<case>_tsne.png`) |
-
-> ℹ️ **t-SNE dependency**  
-> The optional `--tsne` flag requires `scikit-learn` and `matplotlib` to be installed.
 
 ---
 
