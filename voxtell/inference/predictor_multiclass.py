@@ -5,6 +5,7 @@ from typing import List, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch._dynamo import OptimizedModule
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
@@ -66,8 +67,19 @@ class VoxTellPredictor:
         self.perform_everything_on_device = True
 
         # Embedding model
-        self.tokenizer = AutoTokenizer.from_pretrained(text_encoding_model, padding_side='left', local_files_only=True)
-        self.text_backbone = AutoModel.from_pretrained(text_encoding_model, local_files_only=True).eval()
+        # The fast Qwen tokenizer can crash on some Windows/tokenizers
+        # combinations. The slow tokenizer is compatible with the existing
+        # embedding model and is only used once per evaluation case.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            text_encoding_model,
+            padding_side='left',
+            use_fast=True,
+            local_files_only=True,
+        )
+        self.text_backbone = AutoModel.from_pretrained(
+            text_encoding_model,
+            local_files_only=True,
+        ).eval()
         self.max_text_length = 8192
 
         # Load network settings
@@ -90,7 +102,10 @@ class VoxTellPredictor:
             num_heads=32,
             query_dim=2048,
             project_to_decoder_hidden_dim=2048,
-            deep_supervision=False
+            # Preserve the existing predictor configuration. The public API
+            # still consumes only list[0] by default; analysis opts into all
+            # heads explicitly through return_all_layers.
+            deep_supervision=True
         )
 
         # Load weights
@@ -107,6 +122,7 @@ class VoxTellPredictor:
 
         network.eval()
         self.network = network
+        self.decoder_output_metadata = self.network.decoder.get_output_metadata()
 
     def preprocess(self, data: np.ndarray) -> Tuple[torch.Tensor, Tuple, Tuple[int, ...]]:
         """
@@ -209,8 +225,9 @@ class VoxTellPredictor:
     def predict_sliding_window_return_logits(
             self,
             input_image: torch.Tensor,
-            text_embeddings: torch.Tensor
-    ) -> torch.Tensor:
+            text_embeddings: torch.Tensor,
+            return_all_layers: bool = False,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Perform sliding window inference to generate segmentation logits.
 
@@ -219,7 +236,8 @@ class VoxTellPredictor:
             text_embeddings: Text embeddings from embed_text_prompts.
 
         Returns:
-            Predicted logits tensor.
+            Predicted logits tensor, or a list ordered from highest to lowest
+            spatial resolution when ``return_all_layers`` is True.
 
         Raises:
             ValueError: If input_image is not 4D or not a torch.Tensor.
@@ -232,6 +250,9 @@ class VoxTellPredictor:
             )
 
         self.network = self.network.to(self.device)
+        if return_all_layers:
+            # Shapes are patch-dependent and are refreshed for each image.
+            self._observed_decoder_shapes = None
 
         empty_cache(self.device)
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
@@ -243,12 +264,22 @@ class VoxTellPredictor:
             slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
 
             predicted_logits = self._internal_predict_sliding_window_return_logits(
-                data, text_embeddings, slicers, self.perform_everything_on_device
+                data,
+                text_embeddings,
+                slicers,
+                self.perform_everything_on_device,
+                return_all_layers=return_all_layers,
             )
 
             empty_cache(self.device)
             # Revert padding
-            predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
+            if return_all_layers:
+                predicted_logits = [
+                    logits[(slice(None), *slicer_revert_padding[1:])]
+                    for logits in predicted_logits
+                ]
+            else:
+                predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
         return predicted_logits
 
     @torch.inference_mode()
@@ -258,7 +289,8 @@ class VoxTellPredictor:
             text_embeddings: torch.Tensor,
             slicers: List[Tuple],
             do_on_device: bool = True,
-    ) -> torch.Tensor:
+            return_all_layers: bool = False,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Internal method for sliding window prediction with Gaussian weighting.
 
@@ -272,7 +304,8 @@ class VoxTellPredictor:
             do_on_device: If True, keep all tensors on GPU during computation.
 
         Returns:
-            Aggregated prediction logits.
+            Aggregated prediction logits, or one tensor per image-decoder
+            stage ordered from highest to lowest spatial resolution.
 
         Raises:
             RuntimeError: If inf values are encountered in predictions.
@@ -297,11 +330,20 @@ class VoxTellPredictor:
         t = Thread(target=producer, args=(data, slicers, queue))
         t.start()
 
-        # preallocate arrays
-        predicted_logits = torch.zeros((text_embeddings.shape[1], *data.shape[1:]),
-                                       dtype=torch.half,
-                                       device=results_device)
-        n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+        # All requested heads are accumulated on the full padded grid. Lower-
+        # resolution decoder outputs are interpolated to the current tile
+        # before Gaussian blending, so every returned head has the same shape.
+        n_outputs = (
+            len(self.network.decoder.stages)
+            if return_all_layers or self.network.deep_supervision else 1
+        )
+        predicted_logits = [
+            torch.zeros((text_embeddings.shape[1], *data.shape[1:]),
+                        dtype=torch.float32,
+                        device=results_device)
+            for _ in range(n_outputs)
+        ]
+        n_predictions = torch.zeros(data.shape[1:], dtype=torch.float32, device=results_device)
 
         gaussian = compute_gaussian(
             tuple(self.patch_size),
@@ -317,31 +359,67 @@ class VoxTellPredictor:
                     queue.task_done()
                     break
                 patch, tile_slice = item
-                prediction = self.network(patch, text_embeddings)[0].to(results_device)
-                prediction *= gaussian
-                predicted_logits[tile_slice] += prediction
+                predictions = self.network(
+                    patch,
+                    text_embeddings,
+                    return_decoder_outputs=return_all_layers,
+                )
+                if not isinstance(predictions, (list, tuple)):
+                    predictions = [predictions]
+                if len(predictions) != len(predicted_logits):
+                    raise RuntimeError(
+                        f'Expected {len(predicted_logits)} decoder predictions, '
+                        f'got {len(predictions)}.'
+                    )
+
+                tile_shape = tuple(s.stop - s.start for s in tile_slice[1:])
+                if return_all_layers and self._observed_decoder_shapes is None:
+                    self._observed_decoder_shapes = [
+                        tuple(int(v) for v in prediction.shape[2:])
+                        for prediction in predictions
+                    ]
+                    self.decoder_output_metadata = self.network.decoder.get_output_metadata(
+                        patch_spatial_shape=tile_shape,
+                        observed_output_shapes=self._observed_decoder_shapes,
+                    )
+                for layer_idx, prediction in enumerate(predictions):
+                    # Model output is [B, N, D, H, W]; remove the singleton
+                    # patch batch dimension before accumulating [N, D, H, W].
+                    prediction = prediction.to(results_device).float()
+                    if prediction.shape[2:] != tile_shape:
+                        prediction = F.interpolate(
+                            prediction,
+                            size=tile_shape,
+                            mode='trilinear',
+                            align_corners=False,
+                        )
+                    prediction = prediction[0] * gaussian
+                    predicted_logits[layer_idx][tile_slice] += prediction
                 n_predictions[tile_slice[1:]] += gaussian
                 queue.task_done()
                 pbar.update()
         queue.join()
 
         # Normalize by number of predictions per voxel
-        torch.div(predicted_logits, n_predictions, out=predicted_logits)
+        for logits in predicted_logits:
+            torch.div(logits, n_predictions, out=logits)
 
         # Check for inf values
-        if torch.any(torch.isinf(predicted_logits)):
+        if any(torch.any(torch.isinf(logits)) for logits in predicted_logits):
             raise RuntimeError(
                 'Encountered inf in predicted array. Aborting... '
                 'If this problem persists, reduce value_scaling_factor in '
                 'compute_gaussian or increase the dtype of predicted_logits to fp32.'
             )
-        return predicted_logits
+        return predicted_logits if return_all_layers else predicted_logits[0]
 
     def predict_single_image(
             self,
             data: np.ndarray,
-            text_prompts: Union[str, List[str]]
-    ) -> np.ndarray:
+            text_prompts: Union[str, List[str]],
+            output_type: str = "binary",
+            return_all_layers: bool = False,
+    ) -> Union[np.ndarray, List[np.ndarray]]:
         """
         Predict segmentation masks for a single image with text prompts.
 
@@ -352,11 +430,23 @@ class VoxTellPredictor:
             data: Image data in RAS orientation (3D or 4D with channel dimension).
             text_prompts: Single text prompt or list of text prompts describing
                 anatomical structures to segment.
+            output_type: Output format for masks. "binary" returns uint8 masks,
+                "probabilities" returns sigmoid probabilities, and "logits"
+                returns raw logits.
 
         Returns:
-            Segmentation masks as numpy array of shape (num_prompts, X, Y, Z)
-            with binary values (0 or 1) indicating the segmented regions.
+            Segmentation output as numpy array of shape (num_prompts, X, Y, Z),
+            or a list of such arrays when ``return_all_layers`` is True.
+            - output_type="binary": uint8 mask values (0 or 1)
+            - output_type="probabilities": float32 probabilities in [0, 1]
+            - output_type="logits": float32 logits
         """
+        valid_output_types = {"binary", "probabilities", "logits"}
+        if output_type not in valid_output_types:
+            raise ValueError(
+                "output_type must be one of "
+                f"{', '.join(sorted(valid_output_types))}, got {output_type}"
+            )
 
         # Preprocess image
         data, bbox, orig_shape = self.preprocess(data)
@@ -365,21 +455,35 @@ class VoxTellPredictor:
         embeddings = self.embed_text_prompts(text_prompts)
 
         # Predict segmentation logits
-        prediction = self.predict_sliding_window_return_logits(data, embeddings).to('cpu')
-
-        # Postprocess logits to get binary segmentation masks
-        with torch.no_grad():
-            prediction = torch.sigmoid(prediction.float()) > 0.5
-
-        segmentation_reverted_cropping = np.zeros(
-            [prediction.shape[0], *orig_shape],
-            dtype=np.uint8
+        predictions = self.predict_sliding_window_return_logits(
+            data,
+            embeddings,
+            return_all_layers=return_all_layers,
         )
-        segmentation_reverted_cropping = insert_crop_into_image(
-            segmentation_reverted_cropping, prediction, bbox
-        )
+        if not return_all_layers:
+            predictions = [predictions]
 
-        return segmentation_reverted_cropping
+        output_dtype = np.uint8 if output_type == "binary" else np.float32
+        outputs = []
+        for prediction in predictions:
+            prediction = prediction.to("cpu").float()
+            # Postprocess logits to get requested output.
+            with torch.no_grad():
+                if output_type == "probabilities":
+                    prediction = torch.sigmoid(prediction)
+                elif output_type == "binary":
+                    prediction = torch.sigmoid(prediction) > 0.5
+
+            prediction_np = prediction.numpy()
+            segmentation_reverted_cropping = np.zeros(
+                [prediction_np.shape[0], *orig_shape],
+                dtype=output_dtype,
+            )
+            outputs.append(insert_crop_into_image(
+                segmentation_reverted_cropping, prediction_np, bbox
+            ))
+
+        return outputs if return_all_layers else outputs[0]
 
 
 if __name__ == '__main__':
@@ -387,13 +491,13 @@ if __name__ == '__main__':
     from nnunetv2.imageio.nibabel_reader_writer import NibabelIOWithReorient
 
     # Default paths - modify these as needed
-    DEFAULT_IMAGE_PATH = "/home/data4/zy/data/CT_MRI_DATA/images/P1/CYST_PA19_P1.nii.gz"
-    DEFAULT_MODEL_DIR = "/home/data4/zy/weight/voxtell"
+    DEFAULT_IMAGE_PATH = "/path/to/your/image.nii.gz"
+    DEFAULT_MODEL_DIR = "/path/to/your/model/directory"
 
     # Configuration
     image_path = DEFAULT_IMAGE_PATH
     model_dir = DEFAULT_MODEL_DIR
-    text_prompts = ["liver"]
+    text_prompts = ["liver", "right kidney", "left kidney", "spleen"]
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     # Load image

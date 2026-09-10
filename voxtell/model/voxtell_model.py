@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 
-from typing import List, Type, Union, Tuple
+from typing import Dict, List, Optional, Type, Union, Tuple
 from dynamic_network_architectures.building_blocks.helper import get_matching_convtransp
 from dynamic_network_architectures.building_blocks.plain_conv_encoder import PlainConvEncoder
 from dynamic_network_architectures.building_blocks.residual import BasicBlockD, BottleneckD
@@ -204,7 +204,8 @@ class VoxTellModel(nn.Module):
     def forward(
         self,
         img: torch.Tensor,
-        text_embedding: torch.Tensor = None
+        text_embedding: torch.Tensor = None,
+        return_decoder_outputs: bool = False,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Forward pass through VoxTell model.
@@ -213,6 +214,9 @@ class VoxTellModel(nn.Module):
             img: Input image tensor of shape (B, C, D, H, W).
             text_embedding: Pre-computed text embeddings of shape (B, N, D) where
                 N is number of prompts and D is embedding dimension.
+            return_decoder_outputs: Return every image-decoder stage when True.
+                This is an analysis-only opt-in; the default return value is
+                identical to the original inference interface.
             
         Returns:
             If deep_supervision is False, returns single prediction tensor of shape (B, N, D, H, W).
@@ -261,12 +265,16 @@ class VoxTellModel(nn.Module):
         for prompt_idx in range(num_prompts):
             # Extract embeddings for this prompt across all stages
             prompt_embeds = [m[:, prompt_idx:prompt_idx + 1] for m in mask_embeddings]
-            outs.append(self.decoder(skips, prompt_embeds))
+            outs.append(self.decoder(
+                skips,
+                prompt_embeds,
+                return_decoder_outputs=return_decoder_outputs,
+            ))
         
         # Concatenate outputs across prompts for each scale
         outs = [torch.cat(scale_outs, dim=1) for scale_outs in zip(*outs)]
 
-        if not self.deep_supervision:
+        if not self.deep_supervision and not return_decoder_outputs:
             outs = outs[0]
 
         return outs
@@ -405,7 +413,8 @@ class VoxTellDecoder(nn.Module):
     def forward(
         self,
         skips: List[torch.Tensor],
-        mask_embeddings: List[torch.Tensor]
+        mask_embeddings: List[torch.Tensor],
+        return_decoder_outputs: bool = False,
     ) -> List[torch.Tensor]:
         """
         Forward pass through decoder with mask embedding fusion.
@@ -418,6 +427,8 @@ class VoxTellDecoder(nn.Module):
                 Last entry should be bottleneck features.
             mask_embeddings: List of mask embeddings for each decoder stage,
                 in order from lowest to highest resolution.
+            return_decoder_outputs: Return all stages even when deep supervision
+                is disabled. Used only by offline analysis.
                 
         Returns:
             List of segmentation predictions. If deep_supervision=False,
@@ -466,7 +477,55 @@ class VoxTellDecoder(nn.Module):
         # Reverse outputs to have highest resolution first
         seg_outputs = seg_outputs[::-1]
 
-        if not self.deep_supervision:
+        if not self.deep_supervision and not return_decoder_outputs:
             return seg_outputs[:1]
         else:
             return seg_outputs
+
+    def get_output_metadata(
+        self,
+        patch_spatial_shape: Optional[Tuple[int, ...]] = None,
+        observed_output_shapes: Optional[List[Tuple[int, ...]]] = None,
+    ) -> List[Dict[str, object]]:
+        """Describe list indices without inferring stage identity from names.
+
+        Decoder computation proceeds from the bottleneck toward full resolution,
+        while ``forward`` reverses ``seg_outputs`` before returning it. Thus
+        decoder stage 1 is the last list entry and decoder stage N is list entry 0.
+        """
+        n_decoder_stages = len(self.stages)
+        if observed_output_shapes is not None and len(observed_output_shapes) != n_decoder_stages:
+            raise ValueError(
+                "observed_output_shapes must contain one shape per decoder stage"
+            )
+
+        metadata: List[Dict[str, object]] = []
+        for decoder_stage in range(1, n_decoder_stages + 1):
+            internal_stage_index = decoder_stage - 1
+            list_index = n_decoder_stages - decoder_stage
+            encoder_skip_index = n_decoder_stages - decoder_stage
+            item: Dict[str, object] = {
+                "name": f"Decoder {decoder_stage}",
+                "decoder_stage": decoder_stage,
+                "internal_stage_index": internal_stage_index,
+                "model_output_list_index": list_index,
+                "encoder_skip_index": encoder_skip_index,
+                "upsampling_order": decoder_stage,
+                "is_final_output": decoder_stage == n_decoder_stages,
+                "head_type": (
+                    "final_mask_einsum"
+                    if decoder_stage == n_decoder_stages
+                    else "intermediate_segmentation_conv"
+                ),
+            }
+            if observed_output_shapes is not None:
+                raw_shape = tuple(int(v) for v in observed_output_shapes[list_index])
+                item["observed_raw_patch_shape"] = list(raw_shape)
+                if patch_spatial_shape is not None:
+                    item["aligned_patch_shape"] = [int(v) for v in patch_spatial_shape]
+                    item["upsample_factor_to_final"] = [
+                        float(dst) / float(src)
+                        for src, dst in zip(raw_shape, patch_spatial_shape)
+                    ]
+            metadata.append(item)
+        return metadata

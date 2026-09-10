@@ -12,14 +12,18 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+# These must be set before importing predictor_multiclass/transformers.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import numpy as np
 import torch
 
 from nnunetv2.imageio.nibabel_reader_writer import NibabelIOWithReorient
 from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 
-from voxtell.inference.predictor import VoxTellPredictor
-from voxtell.utils.metrics import dice_iou, compute_metrics, compute_boundary_metrics
+from voxtell.inference.predictor_multiclass import VoxTellPredictor
+from voxtell.utils.metrics_multiclass import compute_metrics_from_label_map
 
 
 def get_reader_writer(file_path: str):
@@ -114,7 +118,7 @@ Examples:
     parser.add_argument(
         '-m', '--model',
         type=str,
-        required=True,
+        default="D:\\pythonCode\\VoxTell\\model",
         help='Path to VoxTell model directory containing plans.json and fold_0/'
     )
 
@@ -129,7 +133,7 @@ Examples:
     parser.add_argument(
         '--device',
         type=str,
-        default='cuda',
+        default='cpu',
         choices=['cuda', 'cpu'],
         help='Device to use for inference (default: cuda)'
     )
@@ -172,7 +176,7 @@ def main() -> int:
     if not (model_path / 'plans.json').exists():
         raise FileNotFoundError(f"plans.json not found in model directory: {model_path}")
 
-    if not (model_path / 'fold_0' / 'checkpoint_final.pth').exists():
+    if not (model_path / 'checkpoint_final.pth').exists():
         raise FileNotFoundError(f"checkpoint_final.pth not found in {model_path / 'fold_0'}")
 
     # Setup device
@@ -276,63 +280,79 @@ def main() -> int:
 
 
 def predict_batch():
-    prompts = ["spleen", "right_kidney", "left_kidney", "gallbladder", "liver", "stomach", "esophagus",
-               "inferior_vena_cava", "pancreas", "duodenum","aotra"]
+    prompts = ["spleen", "right_kidney", "left_kidney", "gallbladder", "liver", "stomach", "aorta",
+               "inferior_vena_cava", "duodenum", "pancreas", "esophagus"]
     print("\nLabel mapping:")
-    for i, prompt in enumerate(prompts):
+    for i, prompt in enumerate(prompts):  # 如果要combined segmentations，需要标签和和提示引引齐齐
         print(f"  {i + 1}: {prompt}")
 
-    device = torch.device(f'cuda:0')
-    model_path = Path("/home/data4/zy/weight/voxtell")
+    device = torch.device(f'cuda')
+    model_path = Path("/data/zy/VoxTell_from_disk/model")
     predictor = VoxTellPredictor(model_dir=str(model_path), device=device)
 
-    output_folder = Path("./out/Delay_multi")
-    output_folder.mkdir(parents=True, exist_ok=True)
+    sequences=["P1","PreArtery","PV","T2"]
+    for s in sequences:
+        output_folder = Path("./out_multi/"+s)
+        output_folder.mkdir(parents=True, exist_ok=True)
 
-    input_path = Path("/home/data4/zy/data/CT_MRI_DATA/images/Delay")
-    mask_path = Path("/home/data4/zy/data/CT_MRI_DATA/labels/Delay")
-    num = sum(1 for f in os.listdir(input_path) if f.endswith(".nii.gz"))
+        input_path = Path("/data/zy/CT_MRI_DATA_3D/images/"+s)
+        mask_path = Path("/data/zy/CT_MRI_DATA_3D/labels/"+s)
 
-    dices = 0.0
-    ious = 0.0
-    hds = 0.0
-    asds = 0.0
-    for filename in os.listdir(input_path):
-        if filename.endswith('.nii.gz'):
+        num_classes = len(prompts)
+        total_class_dices = np.zeros(num_classes)
+        total_class_ious = np.zeros(num_classes)
+        processed_cases = 0
+        filenames = sorted(f for f in os.listdir(input_path) if f.endswith(".nii.gz"))
+        for filename in filenames:
             image_path = os.path.join(input_path, filename)
 
             reader_writer = get_reader_writer(str(image_path))
-            img, props = reader_writer.read_images([str(image_path)])  # img:ndarray(P,Z,X,Y) [-1,1]
-
-            segmentations = predictor.predict_single_image(img, prompts)  # ndarray:(P,Z,X,Y) {0，1}
+            img, props = reader_writer.read_images([str(image_path)])  # ndarray:(P,Z,Y,X)
+            segmentations = predictor.predict_single_image(img, prompts)
 
             combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
-            for i, seg in enumerate(segmentations):
-                combined_seg[seg > 0] = i + 1
-            save_segmentation(combined_seg, output_folder, filename, props, suffix="nii.gz")
+            for class_index, segmentation in enumerate(segmentations):
+                combined_seg[segmentation > 0] = class_index + 1
+            save_segmentation(
+                combined_seg,
+                output_folder,
+                filename,
+                props,
+                suffix=".nii.gz",
+            )
 
             gt_path = os.path.join(mask_path, filename)
-            gt, _ = reader_writer.read_images([str(gt_path)])  # ndarray:(P,Z,X,Y)
+            gt, _ = reader_writer.read_images([str(gt_path)])
+            dice, iou = compute_metrics_from_label_map(segmentations, gt[0])
 
-            break
-            # dice,iou=dice_iou(segmentations,gt)
-    #         dice, iou = compute_metrics(segmentations, gt)
-    #         hd, asd_val = compute_boundary_metrics(segmentations, gt, spacing=props['spacing'])
-    #         print(f"{filename} dice: {dice:.4f}, iou: {iou:.4f}, hd:{hd:.4f}, asd_val:{asd_val:.4f}")
-    #         dices += dice
-    #         ious += iou
-    #         hds += hd
-    #         asds += asd_val
-    #
-    # mdice = dices * 1.0 / num
-    # miou = ious * 1.0 / num
-    # mhd = hds * 1.0 / num
-    # masd = asds * 1.0 / num
-    # print(f"\ndice: {mdice:.4f}, miou: {miou:.4f}, mhd: {mhd:.4f}, masd: {masd:.4f}")
+            print(f"\nResults for {filename}:")
+            for i, name in enumerate(prompts):
+                print(f"  {name:20s}: Dice {dice[i]:.4f}, IoU {iou[i]:.4f}")
+
+            total_class_dices += np.asarray(dice)
+            total_class_ious += np.asarray(iou)
+            processed_cases += 1
+            del img, segmentations, combined_seg, gt
+
+        if processed_cases == 0:
+            raise RuntimeError(f"No .nii.gz images found in {input_path}")
+
+        mean_class_dices = total_class_dices / processed_cases
+        mean_class_ious = total_class_ious / processed_cases
+
+        print(s+"\n")
+        print("\n" + "=" * 40)
+        print(f"{'Class Name':20s} | {'Mean Dice':10s} | {'Mean IoU':10s}")
+        print("-" * 40)
+        for i, name in enumerate(prompts):
+            print(f"{name:20s} | {mean_class_dices[i]:.4f}     | {mean_class_ious[i]:.4f}")
+
+        print("-" * 40)
+        print(f"{'OVERALL AVERAGE':20s} | {np.mean(mean_class_dices):.4f}     | {np.mean(mean_class_ious):.4f}")
+        print("=" * 40)
 
     return 0
 
 
 if __name__ == '__main__':
-    os.environ['HF_HUB_OFFLINE'] = '1'
     predict_batch()
