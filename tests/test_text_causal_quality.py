@@ -6,11 +6,14 @@ import torch
 
 from voxtell.inference.text_causal_quality import (
     _safe_padding_mask,
+    accumulate_causal_patch_logits,
+    aggregate_attention_coverages,
     build_memory_masks,
     crop_global_mask_to_patch,
     fused_prediction_softdices,
     attention_coverage,
     soft_dice,
+    UNSUPERVISED_SCORES,
 )
 from voxtell.model.transformer import TransformerDecoderLayer
 
@@ -126,8 +129,45 @@ class TextCausalQualityTest(unittest.TestCase):
         attention = torch.tensor([[[0.1, 0.2, 0.3, 0.4]]])
         inside = torch.tensor([[False, True, False, True]])
         self.assertAlmostEqual(attention_coverage(attention, inside), 0.6)
-        weighted = attention_coverage(attention, inside)
-        self.assertAlmostEqual(weighted, 0.6)
+        mean, weighted, median = aggregate_attention_coverages(
+            [0.2, 0.8], [1, 3]
+        )
+        self.assertAlmostEqual(mean, 0.5)
+        self.assertAlmostEqual(weighted, 0.65)
+        self.assertAlmostEqual(median, 0.5)
+
+    def test_overlapping_windows_share_causal_normal_in_out_support(self):
+        shape = (1, 4, 4)
+        causal_normal = torch.zeros(shape)
+        in_sum = torch.zeros(shape)
+        out_sum = torch.zeros(shape)
+        causal_denominator = torch.zeros(shape)
+        first = (slice(0, 1), slice(0, 3), slice(0, 3))
+        second = (slice(0, 1), slice(1, 4), slice(1, 4))
+        ones = torch.ones((1, 3, 3))
+        accumulate_causal_patch_logits(
+            causal_normal, in_sum, out_sum, causal_denominator,
+            ones, ones * 2, ones * 3, first, 1.0, True,
+        )
+        accumulate_causal_patch_logits(
+            causal_normal, in_sum, out_sum, causal_denominator,
+            ones * 10, ones * 20, ones * 30, second, 1.0, False,
+        )
+        valid = causal_denominator > 0
+        self.assertEqual(int(valid.sum()), 9)
+        self.assertTrue(torch.equal(causal_denominator[valid], torch.ones(9)))
+        self.assertTrue(torch.equal(causal_normal[valid], torch.ones(9)))
+        self.assertTrue(torch.equal(in_sum[valid], torch.full((9,), 2.0)))
+        self.assertTrue(torch.equal(out_sum[valid], torch.full((9,), 3.0)))
+        self.assertFalse(bool(valid[:, 3, 3]))
+
+    def test_attention_scores_are_included_in_correlation_inputs(self):
+        for name in (
+            "q_similarity_in_median", "q_similarity_out_median",
+            "attention_coverage_normal", "attention_coverage_normal_weighted",
+            "attention_coverage_normal_median",
+        ):
+            self.assertIn(name, UNSUPERVISED_SCORES)
 
     def test_all_masked_attention_has_no_nan(self):
         layer = TransformerDecoderLayer(
