@@ -206,7 +206,13 @@ class VoxTellModel(nn.Module):
         img: torch.Tensor,
         text_embedding: torch.Tensor = None,
         return_decoder_outputs: bool = False,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        return_diagnostics: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        List[torch.Tensor],
+        Tuple[Union[torch.Tensor, List[torch.Tensor]], Dict[str, object]],
+    ]:
         """
         Forward pass through VoxTell model.
         
@@ -217,6 +223,13 @@ class VoxTellModel(nn.Module):
             return_decoder_outputs: Return every image-decoder stage when True.
                 This is an analysis-only opt-in; the default return value is
                 identical to the original inference interface.
+            memory_key_padding_mask: Optional boolean mask of shape ``(B, S)``
+                for transformer image-memory tokens. ``True`` blocks a token.
+                Rows with every token blocked are made safe by unblocking token
+                zero to avoid undefined all-masked attention softmax values.
+            return_diagnostics: Return ``(prediction, diagnostics)`` where
+                diagnostics contains the transformer ``mask_embedding`` (q),
+                per-layer cross-attention weights, and memory shape.
             
         Returns:
             If deep_supervision is False, returns single prediction tensor of shape (B, N, D, H, W).
@@ -242,13 +255,35 @@ class VoxTellModel(nn.Module):
         text_embed = repeat(text_embedding, 'b n dim -> n b dim')
         text_embed = self.project_text_embed(text_embed)
 
+        if memory_key_padding_mask is not None:
+            if memory_key_padding_mask.ndim != 2:
+                raise ValueError(
+                    "memory_key_padding_mask must have shape (batch, memory_tokens)"
+                )
+            expected_shape = (bottleneck_embed.shape[1], bottleneck_embed.shape[0])
+            if tuple(memory_key_padding_mask.shape) != expected_shape:
+                raise ValueError(
+                    "memory_key_padding_mask shape mismatch: "
+                    f"expected {expected_shape}, got {tuple(memory_key_padding_mask.shape)}"
+                )
+            memory_key_padding_mask = memory_key_padding_mask.to(
+                device=bottleneck_embed.device, dtype=torch.bool
+            )
+            # PyTorch attention returns NaN when every key is masked.  There is
+            # no representable all-blocked softmax, so use one deterministic
+            # fallback key only for those degenerate rows.
+            all_blocked = memory_key_padding_mask.all(dim=1)
+            if bool(all_blocked.any()):
+                memory_key_padding_mask = memory_key_padding_mask.clone()
+                memory_key_padding_mask[all_blocked, 0] = False
+
         # Fuse text and image features through transformer decoder
         # Output shape: (N, B, query_dim)
-        mask_embedding, _ = self.transformer_decoder(
+        mask_embedding, cross_attention = self.transformer_decoder(
             tgt=text_embed,
             memory=bottleneck_embed,
             pos=self.pos_embed,
-            memory_key_padding_mask=None
+            memory_key_padding_mask=memory_key_padding_mask
         )
         # Shape: (N, B, query_dim) -> (B, N, query_dim)
         mask_embedding = repeat(mask_embedding, 'n b dim -> b n dim')
@@ -277,6 +312,16 @@ class VoxTellModel(nn.Module):
         if not self.deep_supervision and not return_decoder_outputs:
             outs = outs[0]
 
+        if return_diagnostics:
+            return outs, {
+                "mask_embedding": mask_embedding,
+                "q": mask_embedding,
+                "cross_attention": cross_attention,
+                "cross_attention_weights": cross_attention,
+                "memory_shape": tuple(int(v) for v in selected_feature.shape[2:]),
+                "memory_tokens": int(bottleneck_embed.shape[0]),
+                "memory_key_padding_mask": memory_key_padding_mask,
+            }
         return outs
 
     @staticmethod

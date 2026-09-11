@@ -226,6 +226,27 @@ for i, prompt in enumerate(text_prompts):
 napari.run()
 ```
 
+## Offline text-causal pseudo-label audit
+
+The diagnostic `voxtell.inference.text_causal_quality` fixes the prompt to
+`liver`, derives the D5 pseudo-label, and reruns only the text cross-attention
+with `only-in` and `only-out` memory masks. It writes per-case scores and
+Spearman correlations without changing SFDA training:
+
+```bash
+python -m voxtell.inference.text_causal_quality \
+  --images /path/to/images \
+  --labels /path/to/labels \
+  --model /path/to/VoxTell_from_disk/model \
+  --text-model /path/to/Qwen3-Embedding-4B \
+  --gt-label 5 \
+  --output-csv output/text_causal_quality_per_case.csv \
+  --summary-json output/text_causal_quality_summary.json
+```
+
+The local VoxTell repository has no CAC implementation, so the audit records
+CAC as unavailable rather than substituting an unrelated confidence proxy.
+
 ## Important: Image Orientation and Spacing
 
 - ⚠️ **Image Orientation (Critical)**: For correct anatomical localization (e.g., distinguishing left from right), images **must be in RAS orientation**. VoxTell was trained on data reoriented using [this specific reader](https://github.com/MIC-DKFZ/nnUNet/blob/86606c53ef9f556d6f024a304b52a48378453641/nnunetv2/imageio/nibabel_reader_writer.py#L101). Orientation mismatches can be a source of error. An easy way to test for this is if a simple prompt like "liver" fails and segments parts of the spleen instead. Make sure your image metadata is correct.
