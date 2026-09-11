@@ -16,6 +16,62 @@ from voxtell.model.transformer import TransformerDecoderLayer
 
 
 class TextCausalQualityTest(unittest.TestCase):
+    def _make_tiny_voxtell(self):
+        try:
+            from dynamic_network_architectures.building_blocks.residual import BasicBlockD
+            from voxtell.model.voxtell_model import VoxTellModel
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"full VoxTell model dependencies unavailable: {exc}")
+        from torch import nn
+
+        old_configs = VoxTellModel.DECODER_CONFIGS
+        VoxTellModel.DECODER_CONFIGS = {
+            0: {"channels": 4, "shape": (8, 8, 8)},
+            1: {"channels": 4, "shape": (4, 4, 4)},
+        }
+        try:
+            return VoxTellModel(
+                input_channels=1, n_stages=2, features_per_stage=[4, 4],
+                conv_op=nn.Conv3d, kernel_sizes=[3, 3], strides=[1, 2],
+                n_blocks_per_stage=1, n_conv_per_stage_decoder=[1],
+                conv_bias=False, norm_op=nn.InstanceNorm3d,
+                norm_op_kwargs={"eps": 1e-5, "affine": True},
+                dropout_op=None, dropout_op_kwargs=None,
+                nonlin=nn.LeakyReLU, nonlin_kwargs={"inplace": True},
+                deep_supervision=False, block=BasicBlockD,
+                num_maskformer_stages=1, query_dim=8, decoder_layer=0,
+                text_embedding_dim=4, num_heads=1,
+                project_to_decoder_hidden_dim=4,
+            )
+        finally:
+            VoxTellModel.DECODER_CONFIGS = old_configs
+
+    def test_real_forward_default_d5_matches_diagnostic_forward(self):
+        model = self._make_tiny_voxtell().eval()
+        image = torch.randn(1, 1, 8, 8, 8)
+        text = torch.randn(1, 1, 4)
+        with torch.no_grad():
+            plain = model(image, text)
+            diagnostic_pred, diagnostics = model(
+                image, text, return_diagnostics=True
+            )
+        self.assertIsInstance(plain, torch.Tensor)
+        self.assertIsInstance(diagnostic_pred, torch.Tensor)
+        self.assertEqual(tuple(plain.shape), tuple(diagnostic_pred.shape))
+        self.assertTrue(torch.equal(plain, diagnostic_pred))
+        self.assertEqual(tuple(diagnostics["q"].shape), (1, 1, 8))
+        self.assertEqual(diagnostics["q"].device, image.device)
+
+    def test_cuda_diagnostic_q_device_when_available(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        model = self._make_tiny_voxtell().to("cuda").eval()
+        image = torch.randn(1, 1, 8, 8, 8, device="cuda")
+        text = torch.randn(1, 1, 4, device="cuda")
+        with torch.no_grad():
+            _, diagnostics = model(image, text, return_diagnostics=True)
+        self.assertEqual(diagnostics["q"].device, image.device)
+
     def test_default_d5_interface_path_is_unchanged(self):
         source = (Path(__file__).parents[1] / "voxtell/model/voxtell_model.py").read_text()
         self.assertIn("memory_key_padding_mask: Optional[torch.Tensor] = None", source)
@@ -70,6 +126,8 @@ class TextCausalQualityTest(unittest.TestCase):
         attention = torch.tensor([[[0.1, 0.2, 0.3, 0.4]]])
         inside = torch.tensor([[False, True, False, True]])
         self.assertAlmostEqual(attention_coverage(attention, inside), 0.6)
+        weighted = attention_coverage(attention, inside)
+        self.assertAlmostEqual(weighted, 0.6)
 
     def test_all_masked_attention_has_no_nan(self):
         layer = TransformerDecoderLayer(
@@ -106,6 +164,18 @@ class TextCausalQualityTest(unittest.TestCase):
         invalid = fused_prediction_softdices(normal, inside, outside, 0)
         self.assertTrue(math.isnan(invalid[0]))
         self.assertTrue(math.isnan(invalid[1]))
+        support = torch.tensor([True, False])
+        supported_in, supported_out = fused_prediction_softdices(
+            normal, inside, outside, 1, support
+        )
+        self.assertAlmostEqual(
+            supported_in,
+            float(soft_dice(torch.sigmoid(normal[support]), torch.sigmoid(inside[support]))),
+        )
+        self.assertAlmostEqual(
+            supported_out,
+            float(soft_dice(torch.sigmoid(normal[support]), torch.sigmoid(outside[support]))),
+        )
 
 
 if __name__ == "__main__":

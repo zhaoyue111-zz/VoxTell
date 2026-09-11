@@ -32,7 +32,8 @@ CSV_FIELDS = [
     "attention_blocked_mass_out", "attention_visible_mass_in",
     "attention_visible_mass_out", "attention_fallback_in",
     "attention_fallback_out", "attention_coverage_normal",
-    "attention_coverage_valid_patches",
+    "attention_coverage_normal_weighted", "attention_coverage_normal_median",
+    "attention_coverage_valid_patches", "causal_support_voxels",
 ]
 CORRELATION_TARGETS = ("dice", "precision", "recall", "high_confidence_fp_ratio")
 UNSUPERVISED_SCORES = (
@@ -82,13 +83,21 @@ def soft_dice(probability_a: torch.Tensor, probability_b: torch.Tensor,
 def fused_prediction_softdices(normal_logits: torch.Tensor,
                                in_logits: torch.Tensor,
                                out_logits: torch.Tensor,
-                               valid_patch_count: int) -> tuple[float, float]:
+                               valid_patch_count: int,
+                               valid_support: torch.Tensor | None = None) -> tuple[float, float]:
     """Compute causal prediction scores from final fused whole-volume logits."""
     if int(valid_patch_count) == 0:
         return float("nan"), float("nan")
     prob_normal = torch.sigmoid(normal_logits)
     prob_in = torch.sigmoid(in_logits)
     prob_out = torch.sigmoid(out_logits)
+    if valid_support is not None:
+        valid_support = valid_support.to(device=prob_normal.device, dtype=torch.bool)
+        if not bool(valid_support.any()):
+            return float("nan"), float("nan")
+        prob_normal = prob_normal[valid_support]
+        prob_in = prob_in[valid_support]
+        prob_out = prob_out[valid_support]
     return (
         float(soft_dice(prob_normal, prob_in)),
         float(soft_dice(prob_normal, prob_out)),
@@ -263,15 +272,17 @@ def _run_causal_case(predictor: Any, image: torch.Tensor, text_embedding: torch.
     in_sum = torch.zeros(padded_shape, dtype=torch.float32)
     out_sum = torch.zeros(padded_shape, dtype=torch.float32)
     denominator = torch.zeros(padded_shape, dtype=torch.float32)
+    causal_denominator = torch.zeros(padded_shape, dtype=torch.float32)
     normal_diagnostics = []
     attention_values = {"in": [], "out": []}
     attention_coverages = []
+    attention_coverage_weights = []
     fallback = {"in": 0, "out": 0}
     valid_patch_count = 0
     q_in_values, q_out_values, q_weights = [], [], []
 
     # Round 1: fuse every normal D5 logit before constructing any mask.
-    for patch_index, slicer in enumerate(slicers):
+    for slicer in slicers:
         tile = padded[slicer][None].to(device)
         amp = torch.autocast(device_type=device.type, enabled=device.type == "cuda")
         with torch.inference_mode(), amp:
@@ -302,7 +313,7 @@ def _run_causal_case(predictor: Any, image: torch.Tensor, text_embedding: torch.
 
     # Round 2: crop the global D5 pseudo-label at each exact sliding-window
     # coordinate, then run only-in/only-out masked cross-attention.
-    for patch_index, diagnostic in enumerate(normal_diagnostics):
+    for diagnostic in normal_diagnostics:
         slicer = diagnostic["slicer"]
         tile = padded[slicer][None].to(device)
         amp = torch.autocast(device_type=device.type, enabled=device.type == "cuda")
@@ -324,18 +335,21 @@ def _run_causal_case(predictor: Any, image: torch.Tensor, text_embedding: torch.
         d5_out = _as_d5_logits(out_outputs)
         _require_finite("only-in D5 logits", d5_in)
         _require_finite("only-out D5 logits", d5_out)
-        probability_in = torch.sigmoid(d5_in[:, 0].float())
-        probability_out = torch.sigmoid(d5_out[:, 0].float())
         q = diagnostic["q"][0, 0]
         fallback_patch = masks["fallback_in"] > 0 or masks["fallback_out"] > 0
         if not fallback_patch:
             valid_patch_count += 1
             token_weight = max(1, int(masks["inside_tokens"].sum().item()))
-            q_in_values.append(_safe_cosine(q, in_diag["mask_embedding"][0, 0]))
-            q_out_values.append(_safe_cosine(q, out_diag["mask_embedding"][0, 0]))
+            q_in_current = in_diag["mask_embedding"][0, 0].detach().cpu()
+            q_out_current = out_diag["mask_embedding"][0, 0].detach().cpu()
+            q_in_values.append(_safe_cosine(q, q_in_current))
+            q_out_values.append(_safe_cosine(q, q_out_current))
             q_weights.append(token_weight)
             attention_coverages.append(
                 attention_coverage(diagnostic["cross_attention"], masks["inside_tokens"])
+            )
+            attention_coverage_weights.append(
+                max(1, int(masks["inside_tokens"].sum().item()))
             )
         attention_values["in"].append(_attention_stats(
             in_diag["cross_attention"][-1], masks["only_in"]
@@ -350,19 +364,26 @@ def _run_causal_case(predictor: Any, image: torch.Tensor, text_embedding: torch.
         weight = gaussian
         in_patch = _resize_logits(d5_in.float(), tile_shape)[0, 0].cpu()
         out_patch = _resize_logits(d5_out.float(), tile_shape)[0, 0].cpu()
-        in_sum[slicer[1:]] += in_patch * weight
-        out_sum[slicer[1:]] += out_patch * weight
+        if not fallback_patch:
+            in_sum[slicer[1:]] += in_patch * weight
+            out_sum[slicer[1:]] += out_patch * weight
+            causal_denominator[slicer[1:]] += weight
 
     crop = revert_padding[1:]
     denom = denominator[crop].clamp_min(torch.finfo(torch.float32).eps)
     normal_logits = [value[crop] for value in padded_normal_logits]
-    in_logits, out_logits = in_sum[crop] / denom, out_sum[crop] / denom
+    causal_denom = causal_denominator[crop]
+    valid_support = causal_denom > 0
+    in_logits = torch.zeros_like(causal_denom)
+    out_logits = torch.zeros_like(causal_denom)
+    in_logits[valid_support] = in_sum[crop][valid_support] / causal_denom[valid_support]
+    out_logits[valid_support] = out_sum[crop][valid_support] / causal_denom[valid_support]
     normal_probabilities = [torch.sigmoid(value) for value in normal_logits]
     probability = normal_probabilities[0].numpy()
     target = align_gt_nearest(target, probability.shape)
     metrics = binary_case_metrics(probability, target, threshold, high_confidence_threshold)
     pred_softdice_in, pred_softdice_out = fused_prediction_softdices(
-        normal_logits[0], in_logits, out_logits, valid_patch_count
+        normal_logits[0], in_logits, out_logits, valid_patch_count, valid_support
     )
     if q_weights:
         q_similarity_in = float(np.average(q_in_values, weights=q_weights))
@@ -383,6 +404,11 @@ def _run_causal_case(predictor: Any, image: torch.Tensor, text_embedding: torch.
         }
         for side, values in attention_values.items()
     }
+    coverage_weighted = (
+        float(np.average(attention_coverages, weights=attention_coverage_weights))
+        if attention_coverages else float("nan")
+    )
+    coverage_median = float(np.median(attention_coverages)) if attention_coverages else float("nan")
     invalid_reason = None if valid_patch_count else "no_valid_patch_after_empty_or_full_global_mask"
     row = {
         "dice": metrics["dice"], "precision": metrics["precision"],
@@ -412,7 +438,10 @@ def _run_causal_case(predictor: Any, image: torch.Tensor, text_embedding: torch.
         "attention_visible_mass_in": attention["in"]["visible"],
         "attention_visible_mass_out": attention["out"]["visible"],
         "attention_coverage_normal": float(np.nanmean(attention_coverages)) if attention_coverages else float("nan"),
+        "attention_coverage_normal_weighted": coverage_weighted,
+        "attention_coverage_normal_median": coverage_median,
         "attention_coverage_valid_patches": len(attention_coverages),
+        "causal_support_voxels": int(valid_support.sum()),
         "attention_fallback_in": fallback["in"],
         "attention_fallback_out": fallback["out"],
     }
