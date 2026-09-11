@@ -34,6 +34,7 @@ CSV_FIELDS = [
     "attention_fallback_out", "attention_coverage_normal",
     "attention_coverage_normal_weighted", "attention_coverage_normal_median",
     "attention_coverage_valid_patches", "causal_support_voxels",
+    "causal_support_ratio",
 ]
 CORRELATION_TARGETS = ("dice", "precision", "recall", "high_confidence_fp_ratio")
 UNSUPERVISED_SCORES = (
@@ -179,20 +180,53 @@ def _safe_cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _attention_stats(attention: Any, blocked: torch.Tensor) -> tuple[float, float]:
-    """Return mean attention mass on blocked and visible memory tokens."""
+    """Return total attention mass on blocked and visible memory-token sets.
+
+    Attention is summed over the memory-token dimension first, then averaged
+    over batch/query/head dimensions. This makes the statistic independent of
+    how many tokens belong to each set.
+    """
     if attention is None:
         return float("nan"), float("nan")
-    weights = attention.detach().float()
-    if weights.ndim == 4:  # tolerate (B, heads, target, memory)
-        weights = weights.mean(dim=1)
-    if weights.ndim != 3:
-        return float("nan"), float("nan")
-    blocked = blocked.to(device=weights.device)
-    visible = ~blocked
-    blocked_mass = weights.masked_select(blocked[:, None, :]).mean() if bool(blocked.any()) else torch.tensor(0.0, device=weights.device)
-    visible_mass = weights.masked_select(visible[:, None, :]).mean() if bool(visible.any()) else torch.tensor(0.0, device=weights.device)
-    return float(blocked_mass.cpu()), float(visible_mass.cpu())
 
+    weights = attention.detach().float()
+    if weights.ndim not in (3, 4):
+        return float("nan"), float("nan")
+
+    blocked = blocked.to(device=weights.device, dtype=torch.bool)
+    if blocked.ndim != 2:
+        return float("nan"), float("nan")
+
+    if weights.shape[0] != blocked.shape[0] or weights.shape[-1] != blocked.shape[1]:
+        return float("nan"), float("nan")
+
+    visible = ~blocked
+
+    if weights.ndim == 3:
+        blocked_mask = blocked[:, None, :]
+        visible_mask = visible[:, None, :]
+    else:
+        blocked_mask = blocked[:, None, None, :]
+        visible_mask = visible[:, None, None, :]
+
+    blocked_mass = (
+        (weights * blocked_mask.to(weights.dtype)).sum(dim=-1).mean()
+        if bool(blocked.any())
+        else torch.zeros((), dtype=weights.dtype, device=weights.device)
+    )
+    visible_mass = (
+        (weights * visible_mask.to(weights.dtype)).sum(dim=-1).mean()
+        if bool(visible.any())
+        else torch.zeros((), dtype=weights.dtype, device=weights.device)
+    )
+
+    blocked_value = (
+        float(blocked_mass.cpu()) if torch.isfinite(blocked_mass) else float("nan")
+    )
+    visible_value = (
+        float(visible_mass.cpu()) if torch.isfinite(visible_mass) else float("nan")
+    )
+    return blocked_value, visible_value
 
 def attention_coverage(attention: Any, inside: torch.Tensor) -> float:
     """Fraction of normal attention mass landing inside the global pseudo-label."""
@@ -428,6 +462,14 @@ def _run_causal_case(predictor: Any, image: torch.Tensor, text_embedding: torch.
     probability = normal_probabilities[0].numpy()
     target = align_gt_nearest(target, probability.shape)
     metrics = binary_case_metrics(probability, target, threshold, high_confidence_threshold)
+
+    causal_support_voxels = int(valid_support.sum().item())
+    prediction_volume_voxels = int(valid_support.numel())
+    causal_support_ratio = safe_ratio(
+        causal_support_voxels,
+        prediction_volume_voxels,
+    )
+
     pred_softdice_in, pred_softdice_out = fused_prediction_softdices(
         causal_normal_logits, in_logits, out_logits, valid_patch_count, valid_support
     )
@@ -485,7 +527,8 @@ def _run_causal_case(predictor: Any, image: torch.Tensor, text_embedding: torch.
         "attention_coverage_normal_weighted": coverage_weighted,
         "attention_coverage_normal_median": coverage_median,
         "attention_coverage_valid_patches": len(attention_coverages),
-        "causal_support_voxels": int(valid_support.sum()),
+        "causal_support_voxels": causal_support_voxels,
+        "causal_support_ratio": causal_support_ratio,
         "attention_fallback_in": fallback["in"],
         "attention_fallback_out": fallback["out"],
     }

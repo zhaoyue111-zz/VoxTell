@@ -12,7 +12,7 @@ from dynamic_network_architectures.building_blocks.simple_conv_blocks import Sta
 from dynamic_network_architectures.initialization.weight_init import InitWeights_He, init_last_bn_before_add_to_0
 from einops import rearrange, repeat
 from positional_encodings.torch_encodings import PositionalEncoding3D
-
+3
 from voxtell.model.transformer import TransformerDecoder, TransformerDecoderLayer
 
 

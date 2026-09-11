@@ -6,6 +6,7 @@ import torch
 
 from voxtell.inference.text_causal_quality import (
     _safe_padding_mask,
+    _attention_stats,
     accumulate_causal_patch_logits,
     aggregate_attention_coverages,
     build_memory_masks,
@@ -135,6 +136,32 @@ class TextCausalQualityTest(unittest.TestCase):
         self.assertAlmostEqual(mean, 0.5)
         self.assertAlmostEqual(weighted, 0.65)
         self.assertAlmostEqual(median, 0.5)
+
+    def test_attention_stats_measure_total_mass_not_mean_per_token(self):
+        attention_a = torch.tensor([[[0.1, 0.1, 0.4, 0.4]]])
+        blocked_a = torch.tensor([[True, True, False, False]])
+        blocked_mass_a, visible_mass_a = _attention_stats(attention_a, blocked_a)
+        self.assertAlmostEqual(blocked_mass_a, 0.2, places=6)
+        self.assertAlmostEqual(visible_mass_a, 0.8, places=6)
+
+        attention_b = torch.tensor([[[0.1, 0.1, 0.2, 0.2, 0.2, 0.2]]])
+        blocked_b = torch.tensor([[True, True, False, False, False, False]])
+        blocked_mass_b, visible_mass_b = _attention_stats(attention_b, blocked_b)
+        self.assertAlmostEqual(blocked_mass_b, 0.2, places=6)
+        self.assertAlmostEqual(visible_mass_b, 0.8, places=6)
+        self.assertAlmostEqual(visible_mass_a, visible_mass_b, places=6)
+
+    def test_attention_stats_support_multihead_attention(self):
+        attention = torch.tensor([
+            [
+                [[0.1, 0.2, 0.3, 0.4]],
+                [[0.2, 0.1, 0.2, 0.5]],
+            ]
+        ])
+        blocked = torch.tensor([[True, True, False, False]])
+        blocked_mass, visible_mass = _attention_stats(attention, blocked)
+        self.assertAlmostEqual(blocked_mass, 0.3, places=6)
+        self.assertAlmostEqual(visible_mass, 0.7, places=6)
 
     def test_overlapping_windows_share_causal_normal_in_out_support(self):
         shape = (1, 4, 4)
