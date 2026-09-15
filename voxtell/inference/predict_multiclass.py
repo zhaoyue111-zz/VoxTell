@@ -7,6 +7,7 @@ with free-text prompts.
 """
 
 import argparse
+import csv
 import os
 import sys
 from pathlib import Path
@@ -24,6 +25,137 @@ from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 
 from voxtell.inference.predictor_multiclass import VoxTellPredictor
 from voxtell.utils.metrics_multiclass import compute_metrics_from_label_map
+
+
+PREDICTION_THRESHOLD = 0.5
+OVERALL_HISTOGRAM_BINS = 500_000
+
+
+def case_background_probability_stats(
+        foreground_probability: np.ndarray,
+        gt_foreground: np.ndarray,
+        predicted_foreground: Optional[np.ndarray] = None,
+        threshold: float = PREDICTION_THRESHOLD,
+) -> dict:
+    """Summarize foreground probabilities among predicted-background pixels."""
+    probability = np.asarray(foreground_probability, dtype=np.float32)
+    gt_foreground = np.asarray(gt_foreground, dtype=bool)
+    if probability.shape != gt_foreground.shape:
+        raise ValueError(
+            f"Probability/GT shape mismatch: {probability.shape} vs {gt_foreground.shape}"
+        )
+
+    if predicted_foreground is None:
+        # The predictor's existing binary path thresholds sigmoid probabilities with > 0.5.
+        # Preserve that exact decision rule, including the treatment of values equal to 0.5.
+        predicted_background = probability <= threshold
+    else:
+        predicted_foreground = np.asarray(predicted_foreground, dtype=bool)
+        if predicted_foreground.shape != probability.shape:
+            raise ValueError(
+                "Prediction/Probability shape mismatch: "
+                f"{predicted_foreground.shape} vs {probability.shape}"
+            )
+        predicted_background = ~predicted_foreground
+    tn_values = probability[predicted_background & ~gt_foreground]
+    fn_values = probability[predicted_background & gt_foreground]
+
+    def summarize(values: np.ndarray, prefix: str, quantiles: dict) -> dict:
+        result = {f"{prefix}_count": int(values.size)}
+        if values.size == 0:
+            result.update({key: float("nan") for key in quantiles})
+            return result
+        for key, statistic in quantiles.items():
+            if statistic == "mean":
+                result[key] = float(np.mean(values, dtype=np.float64))
+            elif statistic == "min":
+                result[key] = float(np.min(values))
+            elif statistic == "max":
+                result[key] = float(np.max(values))
+            else:
+                result[key] = float(np.percentile(values, statistic))
+        return result
+
+    stats = summarize(
+        tn_values,
+        "tn",
+        {
+            "tn_fg_prob_mean": "mean",
+            "tn_fg_prob_max": "max",
+            "tn_fg_prob_p95": 95,
+        },
+    )
+    stats.update(summarize(
+        fn_values,
+        "fn",
+        {
+            "fn_fg_prob_min": "min",
+            "fn_fg_prob_mean": "mean",
+            "fn_fg_prob_max": "max",
+            "fn_fg_prob_p90": 90,
+            "fn_fg_prob_p95": 95,
+        },
+    ))
+    return stats
+
+
+class StreamingProbabilityStats:
+    """Pool pixel statistics without retaining all test-volume probabilities."""
+
+    def __init__(self, bins: int = OVERALL_HISTOGRAM_BINS):
+        self.bins = int(bins)
+        self.count = 0
+        self.total = 0.0
+        self.minimum = float("inf")
+        self.maximum = float("-inf")
+        self.histogram = np.zeros(self.bins, dtype=np.int64)
+
+    def update(self, values: np.ndarray) -> None:
+        values = np.asarray(values, dtype=np.float32)
+        if values.size == 0:
+            return
+        self.count += int(values.size)
+        self.total += float(np.sum(values, dtype=np.float64))
+        self.minimum = min(self.minimum, float(np.min(values)))
+        self.maximum = max(self.maximum, float(np.max(values)))
+        bin_indices = np.floor(
+            values * (self.bins / PREDICTION_THRESHOLD)
+        ).astype(np.int64)
+        np.clip(bin_indices, 0, self.bins - 1, out=bin_indices)
+        self.histogram += np.bincount(bin_indices, minlength=self.bins)
+
+    def percentile(self, q: float) -> float:
+        if self.count == 0:
+            return float("nan")
+        rank = (self.count - 1) * (q / 100.0)
+        lower_rank = int(np.floor(rank))
+        upper_rank = int(np.ceil(rank))
+        cumulative = np.cumsum(self.histogram)
+
+        def value_at_rank(item_rank: int) -> float:
+            bin_index = int(np.searchsorted(cumulative, item_rank + 1, side="left"))
+            # Return the bin center; the worst-case quantile error is half a bin.
+            return (bin_index + 0.5) * (PREDICTION_THRESHOLD / self.bins)
+
+        lower = value_at_rank(lower_rank)
+        upper = value_at_rank(upper_rank)
+        return float(lower + (rank - lower_rank) * (upper - lower))
+
+    def summary(self, prefix: str, requested: tuple[str, ...]) -> dict:
+        result = {f"{prefix}_count": self.count}
+        for statistic in requested:
+            key = f"{prefix}_fg_prob_{statistic}"
+            if self.count == 0:
+                result[key] = float("nan")
+            elif statistic == "mean":
+                result[key] = self.total / self.count
+            elif statistic == "min":
+                result[key] = self.minimum
+            elif statistic == "max":
+                result[key] = self.maximum
+            else:
+                result[key] = self.percentile(float(statistic[1:]))
+        return result
 
 
 def get_reader_writer(file_path: str):
@@ -289,10 +421,33 @@ def predict_batch():
     device = torch.device(f'cuda')
     model_path = Path("/data/zy/VoxTell_from_disk/model")
     predictor = VoxTellPredictor(model_dir=str(model_path), device=device)
+    # All four sequences use the same fixed prompts. Encode once in small chunks
+    # to avoid keeping the text backbone and segmentation network on the GPU at once.
+    text_embeddings = predictor.embed_text_prompts(prompts, batch_size=1)
+    # Keep the full-volume Gaussian-fusion accumulator on host memory; patch
+    # inference itself still runs on CUDA and preserves the same accumulation order.
+    predictor.perform_everything_on_device = False
 
     sequences=["P1","PreArtery","PV","T2"]
+    output_root = Path("./out_multi")
+    per_case_rows = []
+    all_tn_stats = StreamingProbabilityStats()
+    all_fn_stats = StreamingProbabilityStats()
+    stats_fieldnames = [
+        "tn_count",
+        "tn_fg_prob_mean",
+        "tn_fg_prob_max",
+        "tn_fg_prob_p95",
+        "fn_count",
+        "fn_fg_prob_min",
+        "fn_fg_prob_mean",
+        "fn_fg_prob_max",
+        "fn_fg_prob_p90",
+        "fn_fg_prob_p95",
+    ]
+
     for s in sequences:
-        output_folder = Path("./out_multi/"+s)
+        output_folder = output_root / s
         output_folder.mkdir(parents=True, exist_ok=True)
 
         input_path = Path("/data/zy/CT_MRI_DATA_3D/images/"+s)
@@ -308,7 +463,12 @@ def predict_batch():
 
             reader_writer = get_reader_writer(str(image_path))
             img, props = reader_writer.read_images([str(image_path)])  # ndarray:(P,Z,Y,X)
-            segmentations = predictor.predict_single_image(img, prompts)
+            segmentations, foreground_probabilities = predictor.predict_single_image(
+                img,
+                prompts,
+                return_probabilities=True,
+                text_embeddings=text_embeddings,
+            )
 
             combined_seg = np.zeros_like(segmentations[0], dtype=np.uint8)
             for class_index, segmentation in enumerate(segmentations):
@@ -325,6 +485,28 @@ def predict_batch():
             gt, _ = reader_writer.read_images([str(gt_path)])
             dice, iou = compute_metrics_from_label_map(segmentations, gt[0])
 
+            case_row = {"sequence": s, "case": filename}
+            for class_index, prompt in enumerate(prompts):
+                gt_foreground = gt[0] == (class_index + 1)
+                probability = foreground_probabilities[class_index]
+                case_stats = case_background_probability_stats(
+                    probability,
+                    gt_foreground,
+                    predicted_foreground=segmentations[class_index],
+                )
+                for field, value in case_stats.items():
+                    case_row[f"{prompt}_{field}"] = value
+
+                predicted_background = ~segmentations[class_index].astype(bool)
+                all_tn_stats.update(
+                    probability[predicted_background & ~gt_foreground]
+                )
+                all_fn_stats.update(
+                    probability[predicted_background & gt_foreground]
+                )
+
+            per_case_rows.append(case_row)
+
             print(f"\nResults for {filename}:")
             for i, name in enumerate(prompts):
                 print(f"  {name:20s}: Dice {dice[i]:.4f}, IoU {iou[i]:.4f}")
@@ -333,6 +515,7 @@ def predict_batch():
             total_class_ious += np.asarray(iou)
             processed_cases += 1
             del img, segmentations, combined_seg, gt
+            del foreground_probabilities
 
         if processed_cases == 0:
             raise RuntimeError(f"No .nii.gz images found in {input_path}")
@@ -350,6 +533,44 @@ def predict_batch():
         print("-" * 40)
         print(f"{'OVERALL AVERAGE':20s} | {np.mean(mean_class_dices):.4f}     | {np.mean(mean_class_ious):.4f}")
         print("=" * 40)
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    probability_stats_csv = output_root / "tn_fn_foreground_probability.csv"
+    fieldnames = ["sequence", "case"] + [
+        f"{prompt}_{field}"
+        for prompt in prompts
+        for field in stats_fieldnames
+    ]
+    with probability_stats_csv.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(per_case_rows)
+    print(f"\nSaved per-case TN/FN foreground probability statistics to: {probability_stats_csv}")
+
+    overall_tn = all_tn_stats.summary("tn", ("mean", "max", "p95"))
+    overall_fn = all_fn_stats.summary("fn", ("min", "mean", "max", "p90", "p95"))
+    print("\nOverall TN/FN foreground probability statistics (all sequences and prompts):")
+    print(
+        "TN: "
+        f"count={overall_tn['tn_count']}, "
+        f"mean={overall_tn['tn_fg_prob_mean']:.8g}, "
+        f"max={overall_tn['tn_fg_prob_max']:.8g}, "
+        f"p95={overall_tn['tn_fg_prob_p95']:.8g}"
+    )
+    print(
+        "FN: "
+        f"count={overall_fn['fn_count']}, "
+        f"min={overall_fn['fn_fg_prob_min']:.8g}, "
+        f"mean={overall_fn['fn_fg_prob_mean']:.8g}, "
+        f"max={overall_fn['fn_fg_prob_max']:.8g}, "
+        f"p90={overall_fn['fn_fg_prob_p90']:.8g}, "
+        f"p95={overall_fn['fn_fg_prob_p95']:.8g}"
+    )
+    print(
+        "Overall percentile estimates use a 1e-6 probability histogram "
+        "(percentile granularity is approximately 1e-6)."
+    )
+    del text_embeddings
 
     return 0
 

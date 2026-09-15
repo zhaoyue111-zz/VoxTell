@@ -1,7 +1,7 @@
 import pydoc
 from queue import Queue
 from threading import Thread
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -187,7 +187,11 @@ class VoxTellPredictor:
         return slicers
 
     @torch.inference_mode()
-    def embed_text_prompts(self, text_prompts: Union[List[str], str]) -> torch.Tensor:
+    def embed_text_prompts(
+            self,
+            text_prompts: Union[List[str], str],
+            batch_size: Optional[int] = None,
+    ) -> torch.Tensor:
         """
         Embed text prompts into vector representations.
 
@@ -196,6 +200,8 @@ class VoxTellPredictor:
 
         Args:
             text_prompts: Single text prompt or list of text prompts.
+            batch_size: Optional prompt batch size. When set, prompts are encoded
+                in independent chunks to reduce peak activation memory.
 
         Returns:
             Text embeddings tensor of shape (1, num_prompts, embedding_dim).
@@ -203,19 +209,37 @@ class VoxTellPredictor:
         if isinstance(text_prompts, str):
             text_prompts = [text_prompts]
         n_prompts = len(text_prompts)
+        if batch_size is not None and batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         self.text_backbone = self.text_backbone.to(self.device)
 
         text_prompts = wrap_with_instruction(text_prompts)
-        text_tokens = self.tokenizer(
-            text_prompts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_text_length,
-            return_tensors="pt",
-        )
-        text_tokens = {k: v.to(self.device) for k, v in text_tokens.items()}
-        text_embed = self.text_backbone(**text_tokens)
-        embeddings = last_token_pool(text_embed.last_hidden_state, text_tokens['attention_mask'])
+        if batch_size is None:
+            prompt_batches = [text_prompts]
+        else:
+            prompt_batches = [
+                text_prompts[start:start + batch_size]
+                for start in range(0, n_prompts, batch_size)
+            ]
+        embedding_batches = []
+        for prompt_batch in prompt_batches:
+            text_tokens = self.tokenizer(
+                prompt_batch,
+                padding=True,
+                truncation=True,
+                max_length=self.max_text_length,
+                return_tensors="pt",
+            )
+            text_tokens = {k: v.to(self.device) for k, v in text_tokens.items()}
+            text_embed = self.text_backbone(**text_tokens)
+            embedding_batches.append(
+                last_token_pool(
+                    text_embed.last_hidden_state,
+                    text_tokens['attention_mask'],
+                )
+            )
+            del text_tokens, text_embed
+        embeddings = torch.cat(embedding_batches, dim=0)
         embeddings = embeddings.view(1, n_prompts, -1)
         self.text_backbone = self.text_backbone.to('cpu')
         empty_cache(self.device)
@@ -333,10 +357,7 @@ class VoxTellPredictor:
         # All requested heads are accumulated on the full padded grid. Lower-
         # resolution decoder outputs are interpolated to the current tile
         # before Gaussian blending, so every returned head has the same shape.
-        n_outputs = (
-            len(self.network.decoder.stages)
-            if return_all_layers or self.network.deep_supervision else 1
-        )
+        n_outputs = len(self.network.decoder.stages) if return_all_layers else 1
         predicted_logits = [
             torch.zeros((text_embeddings.shape[1], *data.shape[1:]),
                         dtype=torch.float32,
@@ -366,6 +387,11 @@ class VoxTellPredictor:
                 )
                 if not isinstance(predictions, (list, tuple)):
                     predictions = [predictions]
+                elif not return_all_layers:
+                    # The standard predictor path returns the first (final-mask)
+                    # decoder output only, so do not allocate full-volume buffers
+                    # for deep-supervision outputs that the caller discards.
+                    predictions = predictions[:1]
                 if len(predictions) != len(predicted_logits):
                     raise RuntimeError(
                         f'Expected {len(predicted_logits)} decoder predictions, '
@@ -419,7 +445,9 @@ class VoxTellPredictor:
             text_prompts: Union[str, List[str]],
             output_type: str = "binary",
             return_all_layers: bool = False,
-    ) -> Union[np.ndarray, List[np.ndarray]]:
+            return_probabilities: bool = False,
+            text_embeddings: Optional[torch.Tensor] = None,
+    ) -> Union[np.ndarray, List[np.ndarray], tuple]:
         """
         Predict segmentation masks for a single image with text prompts.
 
@@ -433,6 +461,11 @@ class VoxTellPredictor:
             output_type: Output format for masks. "binary" returns uint8 masks,
                 "probabilities" returns sigmoid probabilities, and "logits"
                 returns raw logits.
+            return_probabilities: Also return sigmoid probabilities alongside the
+                requested output. This is intended for evaluation diagnostics and
+                leaves the default prediction result unchanged.
+            text_embeddings: Optional precomputed embeddings for the supplied
+                prompts. This avoids recomputing fixed prompts across evaluation cases.
 
         Returns:
             Segmentation output as numpy array of shape (num_prompts, X, Y, Z),
@@ -440,6 +473,8 @@ class VoxTellPredictor:
             - output_type="binary": uint8 mask values (0 or 1)
             - output_type="probabilities": float32 probabilities in [0, 1]
             - output_type="logits": float32 logits
+            When ``return_probabilities`` is True, returns a pair containing the
+            requested output and sigmoid probabilities, each with the usual shape.
         """
         valid_output_types = {"binary", "probabilities", "logits"}
         if output_type not in valid_output_types:
@@ -447,12 +482,19 @@ class VoxTellPredictor:
                 "output_type must be one of "
                 f"{', '.join(sorted(valid_output_types))}, got {output_type}"
             )
+        if return_probabilities and output_type != "binary":
+            raise ValueError(
+                "return_probabilities can only be combined with output_type='binary'"
+            )
 
         # Preprocess image
         data, bbox, orig_shape = self.preprocess(data)
 
         # Embed text prompts
-        embeddings = self.embed_text_prompts(text_prompts)
+        if text_embeddings is None:
+            embeddings = self.embed_text_prompts(text_prompts)
+        else:
+            embeddings = text_embeddings.to(self.device)
 
         # Predict segmentation logits
         predictions = self.predict_sliding_window_return_logits(
@@ -465,14 +507,27 @@ class VoxTellPredictor:
 
         output_dtype = np.uint8 if output_type == "binary" else np.float32
         outputs = []
+        probability_outputs = []
         for prediction in predictions:
             prediction = prediction.to("cpu").float()
             # Postprocess logits to get requested output.
             with torch.no_grad():
+                probability = None
+                if output_type in {"binary", "probabilities"} or return_probabilities:
+                    probability = torch.sigmoid(prediction)
+                if return_probabilities:
+                    probability_np = probability.numpy()
+                    probability_reverted_cropping = np.zeros(
+                        [probability_np.shape[0], *orig_shape],
+                        dtype=np.float32,
+                    )
+                    probability_outputs.append(insert_crop_into_image(
+                        probability_reverted_cropping, probability_np, bbox
+                    ))
                 if output_type == "probabilities":
-                    prediction = torch.sigmoid(prediction)
+                    prediction = probability
                 elif output_type == "binary":
-                    prediction = torch.sigmoid(prediction) > 0.5
+                    prediction = probability > 0.5
 
             prediction_np = prediction.numpy()
             segmentation_reverted_cropping = np.zeros(
@@ -483,7 +538,13 @@ class VoxTellPredictor:
                 segmentation_reverted_cropping, prediction_np, bbox
             ))
 
-        return outputs if return_all_layers else outputs[0]
+        result = outputs if return_all_layers else outputs[0]
+        if return_probabilities:
+            probabilities = (
+                probability_outputs if return_all_layers else probability_outputs[0]
+            )
+            return result, probabilities
+        return result
 
 
 if __name__ == '__main__':
