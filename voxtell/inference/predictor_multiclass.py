@@ -43,7 +43,8 @@ class VoxTellPredictor:
     """
 
     def __init__(self, model_dir: str, device: torch.device = torch.device('cuda'),
-                 text_encoding_model: str = 'Qwen/Qwen3-Embedding-4B') -> None:
+                 text_encoding_model: str = 'Qwen/Qwen3-Embedding-4B',
+                 return_all_layers_on_cpu: bool = True) -> None:
         """
         Initialize the VoxTell predictor.
 
@@ -51,6 +52,10 @@ class VoxTellPredictor:
             model_dir: Path to model directory containing plans.json and checkpoint.
             device: PyTorch device to use for inference (default: cuda).
             text_encoding_model: Pretrained text encoding model (Qwen/Qwen3-Embedding-4B).
+            return_all_layers_on_cpu: Accumulate full-volume buffers on CPU for
+                ``return_all_layers=True``. The default protects GPU memory;
+                single-output inference is unchanged. Set False for speed when
+                enough device memory is available.
 
         Raises:
             FileNotFoundError: If model files are not found.
@@ -65,6 +70,9 @@ class VoxTellPredictor:
         # Predictor settings
         self.tile_step_size = 0.5
         self.perform_everything_on_device = True
+        self.return_all_layers_on_cpu = bool(return_all_layers_on_cpu)
+        self._last_preprocess_bbox = None
+        self._last_preprocess_original_shape = None
 
         # Embedding model
         # The fast Qwen tokenizer can crash on some Windows/tokenizers
@@ -146,9 +154,37 @@ class VoxTellPredictor:
         data = data.astype(np.float32)  # this creates a copy
         original_shape = data.shape[1:]
         data, _, bbox = crop_to_nonzero(data, None)
+        self._last_preprocess_bbox = bbox
+        self._last_preprocess_original_shape = tuple(int(v) for v in original_shape)
         data = self.normalization.run(data, None)
         data = torch.from_numpy(data)
         return data, bbox, original_shape
+
+    @staticmethod
+    def valid_inference_mask_from_bbox(
+            original_shape: Tuple[int, ...], bbox: Tuple[Tuple[int, int], ...] | List[List[int]]) -> np.ndarray:
+        """Build the exact spatial mask restored by ``insert_crop_into_image``."""
+        shape = tuple(int(v) for v in original_shape)
+        if len(shape) != 3 or len(bbox) != 3:
+            raise ValueError(f"expected 3-D original_shape and bbox, got {shape}, {bbox}")
+        mask = np.zeros(shape, dtype=bool)
+        slices = []
+        for dimension, (lo, hi) in enumerate(bbox):
+            start = max(0, int(lo))
+            stop = min(shape[dimension], int(hi))
+            if stop <= start:
+                return mask
+            slices.append(slice(start, stop))
+        mask[tuple(slices)] = True
+        return mask
+
+    def get_last_valid_inference_mask(self) -> np.ndarray:
+        """Return the valid full-image area from the most recent preprocessing."""
+        if self._last_preprocess_bbox is None or self._last_preprocess_original_shape is None:
+            raise RuntimeError("preprocess must run before requesting the inference mask")
+        return self.valid_inference_mask_from_bbox(
+            self._last_preprocess_original_shape, self._last_preprocess_bbox
+        )
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]) -> List[Tuple]:
         """
@@ -334,7 +370,10 @@ class VoxTellPredictor:
         Raises:
             RuntimeError: If inf values are encountered in predictions.
         """
-        results_device = self.device if do_on_device else torch.device('cpu')
+        use_cpu_accumulation = return_all_layers and self.return_all_layers_on_cpu
+        results_device = torch.device('cpu') if use_cpu_accumulation else (
+            self.device if do_on_device else torch.device('cpu')
+        )
 
         def producer(data_tensor, slicer_list, queue):
             """Producer thread that loads patches into queue."""
@@ -409,9 +448,10 @@ class VoxTellPredictor:
                         observed_output_shapes=self._observed_decoder_shapes,
                     )
                 for layer_idx, prediction in enumerate(predictions):
-                    # Model output is [B, N, D, H, W]; remove the singleton
-                    # patch batch dimension before accumulating [N, D, H, W].
-                    prediction = prediction.to(results_device).float()
+                    # Model output is [B, N, D, H, W]. Interpolate on the model
+                    # device first, then transfer only the tile to the CPU
+                    # accumulator when all-layer safety mode is enabled.
+                    prediction = prediction.float()
                     if prediction.shape[2:] != tile_shape:
                         prediction = F.interpolate(
                             prediction,
@@ -419,6 +459,7 @@ class VoxTellPredictor:
                             mode='trilinear',
                             align_corners=False,
                         )
+                    prediction = prediction.to(results_device)
                     prediction = prediction[0] * gaussian
                     predicted_logits[layer_idx][tile_slice] += prediction
                 n_predictions[tile_slice[1:]] += gaussian

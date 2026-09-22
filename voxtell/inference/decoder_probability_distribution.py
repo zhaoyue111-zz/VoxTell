@@ -6,9 +6,11 @@ resolution.  This script deliberately maps those outputs back to the model's
 actual low-to-high decoder order: D1 is the earliest (usually 12^3) output and
 D5 is the final (usually 192^3) output.
 
-Only per-region statistics are retained.  Full-volume probabilities are never
-collected across cases, and each decoder volume is released after its row has
-been computed.
+The D1-D4 maps are not raw low-resolution maps: each decoder head is
+upsampled inside a patch and then fused over the full image by sliding-window
+inference. D5 is the final full-volume sliding-window output. Only
+per-region statistics are retained, and each decoder volume is released after
+its row has been computed.
 """
 from __future__ import annotations
 
@@ -24,19 +26,25 @@ import numpy as np
 
 
 DECODER_COUNT = 5
-REGIONS = ("gt_foreground", "gt_background", "d5_false_negative")
+REGIONS = (
+    "gt_foreground", "gt_background_valid", "gt_background_all",
+    "d5_false_negative",
+)
+SUMMARY_REGIONS = ("gt_foreground", "gt_background_valid", "d5_false_negative")
 STAT_FIELDS = ("voxel_count", "mean", "std", "min", "p05", "p25",
                "median", "p75", "p95", "max")
 PER_CASE_FIELDS = (
     "case", "prompt", "decoder_stage", "is_final_output",
     "model_output_list_index", "internal_stage_index", "encoder_skip_index",
     "upsampling_order", "raw_shape", "aligned_shape", "interpolation",
+    "probability_shape", "probability_map_semantics", "valid_mask_source",
     "gt_interpolation", "region", "threshold", *STAT_FIELDS,
 )
 SUMMARY_FIELDS = (
     "case", "case_count", "prompt", "decoder_stage", "is_final_output",
-    "raw_shape", "aligned_shape", "interpolation", "gt_interpolation",
-    "region", "threshold", *STAT_FIELDS,
+    "raw_shape", "aligned_shape", "probability_shape",
+    "probability_map_semantics", "valid_mask_source", "interpolation",
+    "gt_interpolation", "region", "threshold", *STAT_FIELDS,
 )
 
 
@@ -84,7 +92,12 @@ def _as_spatial_array(array: np.ndarray, name: str) -> np.ndarray:
 
 def align_probability_trilinear(probability: np.ndarray,
                                 target_shape: Sequence[int]) -> np.ndarray:
-    """Interpolate one probability map to ``target_shape`` in float32."""
+    """Interpolate one probability map to ``target_shape`` in float32.
+
+    The predictor already returns a full-volume map after patch upsampling and
+    sliding-window fusion. Avoid a no-op interpolation when GT and prediction
+    already have the same shape.
+    """
     import torch
     import torch.nn.functional as F
 
@@ -92,6 +105,8 @@ def align_probability_trilinear(probability: np.ndarray,
     target = tuple(int(v) for v in target_shape)
     if len(target) != 3 or any(v < 1 for v in target):
         raise ValueError(f"target_shape must contain three positive dimensions, got {target}")
+    if probability.shape == target:
+        return probability
     value = torch.from_numpy(probability)[None, None]
     aligned = F.interpolate(value, size=target, mode="trilinear", align_corners=False)
     return aligned[0, 0].numpy().astype(np.float32, copy=False)
@@ -104,6 +119,8 @@ def align_gt_nearest(gt: np.ndarray, target_shape: Sequence[int]) -> np.ndarray:
 
     gt = _as_spatial_array(gt, "gt")
     target = tuple(int(v) for v in target_shape)
+    if gt.shape == target:
+        return gt.astype(bool, copy=False)
     value = torch.from_numpy(gt.astype(np.float32, copy=False))[None, None]
     aligned = F.interpolate(value, size=target, mode="nearest")
     return aligned[0, 0].numpy().astype(bool, copy=False)
@@ -148,8 +165,9 @@ def analyze_case(
     prompt: str = "liver",
     threshold: float = 0.5,
     metadata: Sequence[Mapping[str, Any]] | None = None,
+    valid_inference_mask: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
-    """Return 15 rows for one case, without retaining aligned probability maps.
+    """Return per-region rows without retaining aligned probability maps.
 
     The input probability sequence must use the predictor's returned order
     (high-to-low).  D1..D5 mapping is performed internally and is never based
@@ -165,6 +183,13 @@ def analyze_case(
     gt_array = _as_spatial_array(gt, "gt")
     target_shape = gt_array.shape
     gt_aligned = align_gt_nearest(gt_array, target_shape)
+    if valid_inference_mask is None:
+        valid_mask_aligned = np.ones(target_shape, dtype=bool)
+        valid_mask_source = "all_voxels_default"
+    else:
+        valid_mask = _as_spatial_array(valid_inference_mask, "valid_inference_mask")
+        valid_mask_aligned = align_gt_nearest(valid_mask, target_shape)
+        valid_mask_source = "predictor_crop_to_nonzero_bbox"
 
     md = list(metadata) if metadata is not None else decoder_metadata(
         [p.shape for p in raw], target_shape
@@ -179,7 +204,8 @@ def analyze_case(
     d5_aligned = align_probability_trilinear(d5_raw, target_shape)
     regions = {
         "gt_foreground": gt_aligned,
-        "gt_background": ~gt_aligned,
+        "gt_background_valid": (~gt_aligned) & valid_mask_aligned,
+        "gt_background_all": ~gt_aligned,
         "d5_false_negative": gt_aligned & (d5_aligned < np.float32(threshold)),
     }
 
@@ -189,6 +215,14 @@ def analyze_case(
         list_index = int(info["model_output_list_index"])
         probability = d5_aligned if stage == DECODER_COUNT else align_probability_trilinear(
             raw[list_index], target_shape
+        )
+        probability_interpolation = (
+            "none_same_size" if raw[list_index].shape == target_shape else "trilinear"
+        )
+        probability_semantics = (
+            "final_output_sliding_window_fused_full_volume"
+            if stage == DECODER_COUNT
+            else "patch_upsampled_then_sliding_window_fused_full_volume"
         )
         base = {
             "case": case,
@@ -201,7 +235,10 @@ def analyze_case(
             "upsampling_order": info["upsampling_order"],
             "raw_shape": _json_shape(info.get("raw_shape") or raw[list_index].shape),
             "aligned_shape": _json_shape(target_shape),
-            "interpolation": "trilinear",
+            "probability_shape": _json_shape(raw[list_index].shape),
+            "probability_map_semantics": probability_semantics,
+            "valid_mask_source": valid_mask_source,
+            "interpolation": probability_interpolation,
             "gt_interpolation": "nearest",
             "threshold": float(threshold),
         }
@@ -216,10 +253,20 @@ def analyze_case(
     return rows
 
 
-def summarize_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Average case-level rows, so each case has equal weight."""
+def summarize_rows(
+    rows: Sequence[Mapping[str, Any]],
+    regions: Sequence[str] = SUMMARY_REGIONS,
+) -> list[dict[str, Any]]:
+    """Average case-level rows, so each case has equal weight.
+
+    ``gt_background_all`` remains available in the per-case CSV but is not
+    included by default because it contains restored zero-filled voxels
+    outside the predictor's crop-to-nonzero inference region.
+    """
     groups: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
+        if row["region"] not in regions:
+            continue
         groups[(str(row["decoder_stage"]), str(row["region"]))].append(row)
 
     summary: list[dict[str, Any]] = []
@@ -238,6 +285,11 @@ def summarize_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             "aligned_shape": (first.get("aligned_shape", "")
                               if len({str(r.get("aligned_shape", "")) for r in group}) == 1
                               else "mixed"),
+            "probability_shape": (first.get("probability_shape", "")
+                                  if len({str(r.get("probability_shape", "")) for r in group}) == 1
+                                  else "mixed"),
+            "probability_map_semantics": first.get("probability_map_semantics", ""),
+            "valid_mask_source": first.get("valid_mask_source", ""),
             "interpolation": first.get("interpolation", "trilinear"),
             "gt_interpolation": first.get("gt_interpolation", "nearest"),
             "region": region,
@@ -268,6 +320,30 @@ def _iter_cases(images: str, labels: Path) -> list[tuple[Path, Path]]:
             if (labels / path.name).is_file()]
 
 
+def select_label_value(label_map: np.ndarray, explicit_value: int | None,
+                       case: str = "") -> int:
+    """Resolve a binary GT label without silently choosing among classes."""
+    values = sorted(int(value) for value in np.unique(label_map) if int(value) != 0)
+    if explicit_value is not None:
+        if explicit_value not in values:
+            raise ValueError(
+                f"{case}: requested --label-value {explicit_value}, "
+                f"but non-zero GT labels are {values}"
+            )
+        return int(explicit_value)
+    if len(values) == 1:
+        return values[0]
+    if len(values) > 1:
+        raise ValueError(
+            f"{case}: found multiple non-zero GT labels {values}; "
+            "pass --label-value explicitly"
+        )
+    raise ValueError(
+        f"{case}: found no non-zero GT label; pass --label-value explicitly "
+        "if an all-zero label map is intentional"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--images", required=True, help="Image directory or *.nii.gz glob")
@@ -282,6 +358,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output-dir", default="decoder_probability_distribution")
+    parser.add_argument(
+        "--all-layers-on-device", action="store_true",
+        help="Keep return_all_layers full-volume accumulation on the inference device "
+             "for speed; default is safer CPU accumulation.",
+    )
     return parser.parse_args()
 
 
@@ -308,17 +389,30 @@ def main() -> int:
     if not cases:
         raise RuntimeError("no image/label pairs found")
 
-    predictor = VoxTellPredictor(str(args.model), device=device,
-                                 text_encoding_model=args.text_model)
     reader = NibabelIOWithReorient()
+    resolved_label_values: dict[str, int] = {}
+    # Validate all label maps before loading the model. In particular, do not
+    # silently choose the first class in a multi-label map.
+    for image_path, label_path in cases:
+        case = image_path.name.removesuffix(".nii.gz")
+        label, _ = reader.read_images([str(label_path)])
+        label_map = np.rint(label[0]).astype(np.int64)
+        resolved_label_values[case] = select_label_value(
+            label_map, args.label_value, case
+        )
+        del label_map, label
+
+    predictor = VoxTellPredictor(
+        str(args.model), device=device, text_encoding_model=args.text_model,
+        return_all_layers_on_cpu=not args.all_layers_on_device,
+    )
     per_case_rows: list[dict[str, Any]] = []
     for case_no, (image_path, label_path) in enumerate(cases, 1):
         case = image_path.name.removesuffix(".nii.gz")
         image, _ = reader.read_images([str(image_path)])
         label, _ = reader.read_images([str(label_path)])
         label_map = np.rint(label[0]).astype(np.int64)
-        label_value = (args.label_value if args.label_value is not None else
-                       next((int(v) for v in np.unique(label_map) if v), 1))
+        label_value = resolved_label_values[case]
         gt = label_map == label_value
 
         predictions = predictor.predict_single_image(
@@ -328,6 +422,7 @@ def main() -> int:
         # mapping and explicit interpolation independently of decoder_metrics.csv.
         raw_predictions = [np.asarray(prediction[0], dtype=np.float32)
                            for prediction in predictions]
+        valid_inference_mask = predictor.get_last_valid_inference_mask()
         observed_shapes: list[Sequence[int] | None] = [None] * DECODER_COUNT
         # ``decoder_output_metadata`` is already in D1..D5 order and carries
         # the raw model output shapes captured before predictor-side alignment.
@@ -342,9 +437,10 @@ def main() -> int:
             gt.shape,
         )
         rows = analyze_case(raw_predictions, gt, case=case, prompt=args.prompt,
-                            threshold=args.threshold, metadata=metadata)
+                            threshold=args.threshold, metadata=metadata,
+                            valid_inference_mask=valid_inference_mask)
         per_case_rows.extend(rows)
-        del raw_predictions, predictions, image, label, gt
+        del raw_predictions, predictions, valid_inference_mask, image, label, gt
         print(f"[{case_no}/{len(cases)}] {case}: {len(rows)} distribution rows")
 
     _write_rows(output_dir / "decoder_probability_distribution_per_case.csv",
