@@ -349,7 +349,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--images", required=True, help="Image directory or *.nii.gz glob")
     parser.add_argument("--labels", required=True, help="GT label directory")
     parser.add_argument("--model", default="model")
-    parser.add_argument("--text-model", default="Qwen/Qwen3-Embedding-4B")
+    parser.add_argument("--text-model", default="/mnt/afs2/models/huggingface/hub/models--Qwen--Qwen3-Embedding-4B/snapshots/5cf2132abc99cad020ac570b19d031efec650f2b")
     parser.add_argument("--prompt", default="liver")
     parser.add_argument("--label-value", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=0.5,
