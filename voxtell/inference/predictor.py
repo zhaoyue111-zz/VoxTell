@@ -42,7 +42,7 @@ class VoxTellPredictor:
     """
 
     def __init__(self, model_dir: str, device: torch.device = torch.device('cuda'),
-                 text_encoding_model: str = "/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/model/Qwen3-Embedding-4B") -> None:
+                 text_encoding_model: str = 'Qwen/Qwen3-Embedding-4B') -> None:
         """
         Initialize the VoxTell predictor.
 

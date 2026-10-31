@@ -1,122 +1,170 @@
-import math
 import inspect
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import nibabel as nib
+import torch
 
-from voxtell.inference.oracle_support_diagnostic import (
-    align_mask_nearest,
-    binary_metrics,
-    erode_lesions,
-    exact_topk_mask,
-    gaussian_fuse_patches,
-    normalized_prototype,
-    safe_auc,
+from voxtell.inference.oracle_support_full_volume import (
+    assert_support_query_disjoint,
+    effective_empty_recovery,
+    fuse_probability,
+    gaussian_fuse_features_before_similarity,
+    paired_comparison,
+    random_seed_summary,
+    restore_crop_to_full,
+    save_nifti_like,
+    shuffled_prototype_bank,
+    summarize,
+    verify_baseline_dice,
 )
 
 
 class OracleSupportDiagnosticTests(unittest.TestCase):
-    def test_feature_gt_alignment_uses_nearest(self):
-        mask = np.zeros((2, 2, 2), dtype=bool)
-        mask[0, 0, 0] = True
-        aligned = align_mask_nearest(mask, (4, 4, 4))
-        self.assertEqual(aligned.dtype, np.bool_)
-        self.assertEqual(int(aligned.sum()), 8)
-        self.assertTrue(aligned[:2, :2, :2].all())
+    def test_full_volume_crop_restoration(self):
+        crop = np.arange(24).reshape(2, 3, 4)
+        full = restore_crop_to_full(crop, ((1, 3), (2, 5), (1, 5)), (4, 7, 6))
+        self.assertEqual(full.shape, (4, 7, 6))
+        np.testing.assert_array_equal(full[1:3, 2:5, 1:5], crop)
+        self.assertEqual(int(np.count_nonzero(full)), int(np.count_nonzero(crop)))
 
-    def test_gaussian_fusion_normalizes_overlap(self):
-        gaussian = np.ones((2, 2, 2), dtype=np.float32)
-        fused = gaussian_fuse_patches(
-            [np.ones((2, 2, 2)), np.full((2, 2, 2), 3)],
-            [
-                (slice(0, 2), slice(0, 2), slice(0, 2)),
-                (slice(1, 3), slice(0, 2), slice(0, 2)),
-            ],
-            gaussian,
-            (3, 2, 2),
+    def test_saved_nifti_preserves_original_shape_and_affine(self):
+        internal = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+        affine = np.array([
+            [1.5, 0, 0, 10], [0, 2.0, 0, 20], [0, 0, 3.0, 30], [0, 0, 0, 1],
+        ], dtype=np.float64)
+        properties = {
+            "nibabel_stuff": {
+                "reoriented_affine": affine.copy(),
+                "original_affine": affine.copy(),
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "restored.nii.gz"
+            save_nifti_like(internal, path, properties)
+            restored = nib.load(path)
+            self.assertEqual(restored.shape, (4, 3, 2))
+            np.testing.assert_allclose(restored.affine, affine)
+
+    def test_baseline_csv_mismatch_fails(self):
+        self.assertLess(verify_baseline_dice("ok", 0.5, 0.50001), 1e-4)
+        with self.assertRaisesRegex(RuntimeError, "baseline Dice mismatch"):
+            verify_baseline_dice("bad", 0.5, 0.5002)
+
+    def test_support_query_sets_must_not_overlap(self):
+        assert_support_query_disjoint(["support"], ["query"])
+        with self.assertRaisesRegex(AssertionError, "overlap"):
+            assert_support_query_disjoint(["same"], ["same"])
+
+    def test_gt_is_not_an_input_to_fusion_or_parameter_selection(self):
+        parameters = inspect.signature(fuse_probability).parameters
+        self.assertEqual(list(parameters), ["baseline_probability", "standardized_score", "alpha"])
+        baseline = np.full((2, 2, 2), 0.4, np.float32)
+        score = np.ones_like(baseline)
+        np.testing.assert_array_equal(
+            fuse_probability(baseline, score, 0.5),
+            fuse_probability(baseline, score, 0.5),
         )
-        np.testing.assert_allclose(fused[0], 1)
-        np.testing.assert_allclose(fused[1], 2)
-        np.testing.assert_allclose(fused[2], 3)
 
-    def test_prototype_is_unit_normalized_after_mean(self):
-        prototype = normalized_prototype(np.asarray([[3, 0], [1, 0], [2, 0]], np.float32))
-        np.testing.assert_allclose(prototype, [1, 0], atol=1e-6)
-        self.assertAlmostEqual(float(np.linalg.norm(prototype)), 1.0, places=6)
+    def test_query_fuses_features_before_similarity(self):
+        # At the overlap voxel patch-score averaging would yield (1+0)/2=0.5.
+        # Feature fusion produces [1,1], whose cosine to [1,0] is 1/sqrt(2).
+        patch_a = np.zeros((2, 1, 1, 2), np.float32)
+        patch_b = np.zeros((2, 1, 1, 2), np.float32)
+        patch_a[:, 0, 0] = np.array([[1, 1], [1, 0]])
+        patch_b[:, 0, 0] = np.array([[0, 1], [1, 1]])
+        score = gaussian_fuse_features_before_similarity(
+            [patch_a, patch_b],
+            [(slice(0, 1), slice(0, 1), slice(0, 2)), (slice(0, 1), slice(0, 1), slice(1, 3))],
+            np.ones((1, 1, 2), np.float32),
+            (1, 1, 3),
+            np.array([1, 0], np.float32),
+        )
+        self.assertAlmostEqual(float(score[0, 0, 1]), 1 / np.sqrt(2), places=6)
+        self.assertNotAlmostEqual(float(score[0, 0, 1]), 0.5, places=6)
 
-    def test_topk_count_is_exact_even_with_ties(self):
-        scores = np.ones((3, 3, 3), dtype=np.float32)
-        roi = np.ones_like(scores, dtype=bool)
-        selected = exact_topk_mask(scores, roi, 7)
-        self.assertEqual(int(selected.sum()), 7)
-        np.testing.assert_array_equal(np.flatnonzero(selected), np.arange(7))
+    def test_random_multiseed_summary(self):
+        prototype = np.array([[1, 2, 3, 4]], np.float32)
+        banks = [shuffled_prototype_bank(prototype, seed) for seed in range(42, 52)]
+        self.assertEqual(len(banks), 10)
+        self.assertTrue(all(np.allclose(np.linalg.norm(bank, axis=1), 1) for bank in banks))
+        rows = []
+        for index, seed in enumerate(range(42, 52)):
+            rows.extend((
+                {"random_seed": seed, "metric": float(index)},
+                {"random_seed": seed, "metric": float(index + 2)},
+            ))
+        summary = random_seed_summary(rows, "metric")
+        self.assertEqual(summary["n_seeds"], 10)
+        self.assertEqual(summary["seed_case_means"]["42"], 1.0)
+        self.assertEqual(summary["seed_case_means"]["51"], 10.0)
+        self.assertAlmostEqual(summary["mean"], 5.5)
+        self.assertGreater(summary["std"], 0)
+        comparison = paired_comparison([2, 3, 4], [1, 1, 1], samples=500)
+        self.assertEqual(comparison["n"], 3)
+        self.assertEqual(len(comparison["case_differences"]), 3)
 
-    def test_empty_mask_and_single_class_auc_do_not_raise(self):
-        empty = np.zeros((2, 2, 2), dtype=bool)
-        metrics = binary_metrics(empty, empty)
-        self.assertEqual(metrics["dice"], 1.0)
-        self.assertEqual(metrics["pred_foreground_voxels"], 0)
-        auroc, auprc, reason = safe_auc(empty, np.zeros_like(empty, dtype=float))
-        self.assertTrue(math.isnan(auroc))
-        self.assertTrue(math.isnan(auprc))
-        self.assertEqual(reason, "single_class_no_positive")
-        auroc, auprc, reason = safe_auc(np.asarray([], bool), np.asarray([], float))
-        self.assertTrue(math.isnan(auroc))
-        self.assertTrue(math.isnan(auprc))
-        self.assertEqual(reason, "empty_evaluation_region")
+    def test_summary_reports_fixed_alpha_and_seed_level_controls(self):
+        def localization(bank, value, seed=""):
+            return {
+                "case_id": "q", "bank": bank,
+                "score_mode": "native" if bank == "baseline_probability" else "max",
+                "random_seed": seed, "auprc": value,
+                "dice_at_oracle_volume": value, "fn_region_auprc": value,
+                "fn_recall_at_1v": value,
+            }
 
-    def test_one_voxel_lesion_erosion_falls_back(self):
-        mask = np.zeros((5, 5, 5), dtype=bool)
-        mask[2, 2, 2] = True
-        eroded, records = erode_lesions(mask)
-        self.assertTrue(np.array_equal(eroded, mask))
-        self.assertTrue(records[0]["erosion_fallback"])
+        rows = [
+            localization("baseline_probability", 0.2),
+            localization("oracle", 0.6),
+            localization("prediction", 0.4),
+        ]
+        rows.extend(localization("random", 0.1 + seed / 10000, seed) for seed in range(42, 52))
+        fusion = []
+        for alpha in (0.25, 0.5, 1.0, 2.0):
+            fusion.append({
+                "case_id": "q", "bank": "oracle", "score_mode": "max", "alpha": alpha,
+                "delta_dice": 0.03, "delta_recall": 0.2, "delta_precision": -0.05,
+                "effective_empty_recovery": True, "baseline_empty_prediction": True,
+                "dice": 0.1, "recall": 0.2, "precision": 0.1,
+                "tp": 10, "fp": 90, "lesion_hits": 1,
+            })
+        result = summarize(rows, fusion, {}, [])
+        self.assertEqual(result["random_control"]["auprc"]["n_seeds"], 10)
+        self.assertEqual(result["answers"]["fixed_alpha_improved_declined_unchanged"]["1.0"]["improved"], 1)
+        self.assertEqual(result["answers"]["empty_prediction_effective_recovery"]["1.0"]["recovered"], 1)
+        self.assertFalse(result["answers"]["recall_precision_tradeoff"]["1.0"]["recall_gain_with_severe_precision_loss"])
 
-    def test_return_features_is_opt_in(self):
+    def test_one_tp_is_not_effective_empty_recovery(self):
+        weak = {"dice": 0.001, "recall": 0.001, "tp": 1, "fp": 0}
+        self.assertFalse(effective_empty_recovery(True, weak, 1))
+        adequate = {"dice": 0.06, "recall": 0.11, "tp": 10, "fp": 50}
+        self.assertTrue(effective_empty_recovery(True, adequate, 1))
+
+    def test_return_features_false_preserves_decoder_output(self):
         from voxtell.model.voxtell_model import VoxTellDecoder, VoxTellModel
 
-        model_parameter = inspect.signature(VoxTellModel.forward).parameters["return_features"]
-        decoder_parameter = inspect.signature(VoxTellDecoder.forward).parameters["return_features"]
-        self.assertIs(model_parameter.default, False)
-        self.assertIs(decoder_parameter.default, False)
-
-    def test_decoder_returns_identical_logits_with_feature_opt_in(self):
-        import torch
-        from torch import nn
-        from voxtell.model.voxtell_model import VoxTellDecoder
-
+        self.assertIs(inspect.signature(VoxTellModel.forward).parameters["return_features"].default, False)
         encoder = SimpleNamespace(
-            output_channels=[2] * 6,
-            conv_op=nn.Conv3d,
-            conv_bias=True,
-            norm_op=None,
-            norm_op_kwargs=None,
-            dropout_op=None,
-            dropout_op_kwargs=None,
-            nonlin=nn.LeakyReLU,
-            nonlin_kwargs={"inplace": False},
-            kernel_sizes=[3] * 6,
-            strides=[1, 2, 2, 2, 2, 2],
+            output_channels=[2] * 6, conv_op=torch.nn.Conv3d,
+            strides=[1, 2, 2, 2, 2, 2], conv_bias=False,
+            norm_op=None, norm_op_kwargs=None, dropout_op=None,
+            dropout_op_kwargs=None, nonlin=torch.nn.LeakyReLU,
+            nonlin_kwargs={"inplace": False}, kernel_sizes=[3] * 6,
         )
-        decoder = VoxTellDecoder(
-            encoder=encoder,
-            num_classes=1,
-            n_conv_per_stage=[1] * 5,
-            deep_supervision=False,
-            num_maskformer_stages=5,
-            num_heads=1,
-        ).eval()
-        skips = [
-            torch.randn(1, 2, size, size, size)
-            for size in (32, 16, 8, 4, 2, 1)
-        ]
+        decoder = VoxTellDecoder(encoder, 1, [1] * 5, False, num_maskformer_stages=5, num_heads=1).eval()
+        skips = [torch.randn(1, 2, size, size, size) for size in (32, 16, 8, 4, 2, 1)]
         embeddings = [torch.randn(1, 1, 2) for _ in range(5)]
         with torch.no_grad():
-            default = decoder(skips, embeddings)
-            opted_in, d5 = decoder(skips, embeddings, return_features=True)
-        self.assertEqual(tuple(d5.shape), (1, 2, 32, 32, 32))
-        torch.testing.assert_close(default[0], opted_in[0])
+            omitted_default = decoder(skips, embeddings)
+            original_interface = decoder(skips, embeddings, return_features=False)
+            opted_in, feature = decoder(skips, embeddings, return_features=True)
+        torch.testing.assert_close(omitted_default[0], original_interface[0])
+        torch.testing.assert_close(original_interface[0], opted_in[0])
+        self.assertEqual(tuple(feature.shape), (1, 2, 32, 32, 32))
 
 
 if __name__ == "__main__":
