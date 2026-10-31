@@ -208,6 +208,7 @@ class VoxTellModel(nn.Module):
         return_decoder_outputs: bool = False,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
         return_diagnostics: bool = False,
+        return_features: bool = False,
     ) -> Union[
         torch.Tensor,
         List[torch.Tensor],
@@ -230,6 +231,10 @@ class VoxTellModel(nn.Module):
             return_diagnostics: Return ``(prediction, diagnostics)`` where
                 diagnostics contains the transformer ``mask_embedding`` (q),
                 per-layer cross-attention weights, and memory shape.
+            return_features: Return ``(prediction, features)`` with the D5
+                visual tensor immediately before the final text-conditioned
+                einsum head. This is opt-in so the training and inference
+                return types are unchanged by default.
             
         Returns:
             If deep_supervision is False, returns single prediction tensor of shape (B, N, D, H, W).
@@ -296,15 +301,23 @@ class VoxTellModel(nn.Module):
 
         # Generate segmentation outputs for each text prompt
         outs = []
+        d5_pre_head_features = []
         num_prompts = text_embedding.shape[1]
         for prompt_idx in range(num_prompts):
             # Extract embeddings for this prompt across all stages
             prompt_embeds = [m[:, prompt_idx:prompt_idx + 1] for m in mask_embeddings]
-            outs.append(self.decoder(
+            decoder_result = self.decoder(
                 skips,
                 prompt_embeds,
                 return_decoder_outputs=return_decoder_outputs,
-            ))
+                return_features=return_features,
+            )
+            if return_features:
+                decoder_outputs, d5_pre_head = decoder_result
+                outs.append(decoder_outputs)
+                d5_pre_head_features.append(d5_pre_head)
+            else:
+                outs.append(decoder_result)
         
         # Concatenate outputs across prompts for each scale
         outs = [torch.cat(scale_outs, dim=1) for scale_outs in zip(*outs)]
@@ -312,8 +325,8 @@ class VoxTellModel(nn.Module):
         if not self.deep_supervision and not return_decoder_outputs:
             outs = outs[0]
 
-        if return_diagnostics:
-            return outs, {
+        if return_diagnostics or return_features:
+            diagnostics = {
                 "mask_embedding": mask_embedding,
                 "q": mask_embedding,
                 "cross_attention": cross_attention,
@@ -322,6 +335,13 @@ class VoxTellModel(nn.Module):
                 "memory_tokens": int(bottleneck_embed.shape[0]),
                 "memory_key_padding_mask": memory_key_padding_mask,
             }
+            if return_features:
+                # [B, prompt, C, D, H, W]. Keeping the prompt axis makes the
+                # relationship explicit if analysis is ever run with >1 prompt.
+                diagnostics["d5_pre_head"] = torch.stack(
+                    d5_pre_head_features, dim=1
+                )
+            return outs, diagnostics
         return outs
 
     @staticmethod
@@ -460,7 +480,11 @@ class VoxTellDecoder(nn.Module):
         skips: List[torch.Tensor],
         mask_embeddings: List[torch.Tensor],
         return_decoder_outputs: bool = False,
-    ) -> List[torch.Tensor]:
+        return_features: bool = False,
+    ) -> Union[
+        List[torch.Tensor],
+        Tuple[List[torch.Tensor], torch.Tensor],
+    ]:
         """
         Forward pass through decoder with mask embedding fusion.
         
@@ -474,6 +498,8 @@ class VoxTellDecoder(nn.Module):
                 in order from lowest to highest resolution.
             return_decoder_outputs: Return all stages even when deep supervision
                 is disabled. Used only by offline analysis.
+            return_features: Also return the final-stage visual tensor just
+                before the D5 mask einsum head.
                 
         Returns:
             List of segmentation predictions. If deep_supervision=False,
@@ -483,6 +509,7 @@ class VoxTellDecoder(nn.Module):
         """
         lres_input = skips[-1]
         seg_outputs = []
+        d5_pre_head = None
         
         # Reverse mask embeddings to match decoder stage order (bottleneck first)
         mask_embeddings = mask_embeddings[::-1]
@@ -498,6 +525,7 @@ class VoxTellDecoder(nn.Module):
                 # Final stage: generate segmentation via einsum
                 # x: (B, C, H, W, D), mask_embeddings[-1]: (B, N, C)
                 # Output: (B, N, H, W, D)
+                d5_pre_head = x
                 seg_pred = torch.einsum('b c h w d, b n c -> b n h w d', x, mask_embeddings[-1])
                 seg_outputs.append(seg_pred)
             elif stage_idx >= len(self.stages) - len(mask_embeddings):
@@ -523,9 +551,15 @@ class VoxTellDecoder(nn.Module):
         seg_outputs = seg_outputs[::-1]
 
         if not self.deep_supervision and not return_decoder_outputs:
-            return seg_outputs[:1]
+            result = seg_outputs[:1]
         else:
-            return seg_outputs
+            result = seg_outputs
+
+        if return_features:
+            if d5_pre_head is None:
+                raise RuntimeError("decoder did not produce a D5 pre-head feature")
+            return result, d5_pre_head
+        return result
 
     def get_output_metadata(
         self,

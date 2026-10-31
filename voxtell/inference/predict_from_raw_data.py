@@ -7,6 +7,7 @@ with free-text prompts.
 """
 
 import argparse
+import csv
 import os
 import sys
 from pathlib import Path
@@ -283,7 +284,7 @@ def predict_batch():
         print(f"  {i + 1}: {prompt}")
 
     device = torch.device(f'cuda:0')
-    model_path = Path("/home/data4/zy/weight/voxtell")
+    model_path = Path("/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/model")
     predictor = VoxTellPredictor(model_dir=str(model_path), device=device)
 
     output_folder = Path("./out/Delay_multi")
@@ -332,7 +333,626 @@ def predict_batch():
 
     return 0
 
+def evaluate_saved_predictions():
+    prompts = ["liver"]
+    sequences = ["DWI"]
+
+    data_root = Path("/data/hilab/datasets/WCH_MRI145")
+    output_folder = Path("/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/WCH_MREI145_predict/liver")
+
+    for sequence in sequences:
+        mask_dir = data_root / sequence / "liver"
+        pred_dir = output_folder / sequence
+
+        filenames = sorted(p.name for p in pred_dir.glob("*.nii.gz") if p.is_file())
+
+        if not filenames:
+            print(f"{sequence}: 没有找到预测结果")
+            continue
+
+        metric_values = []
+        csv_path = pred_dir / "metrics.csv"
+
+        with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["filename", "prompt", "dice", "iou", "hd", "asd"])
+
+            for filename in filenames:
+                pred_path = pred_dir / filename
+                gt_path = mask_dir / filename
+
+                if not gt_path.is_file():
+                    print(f"跳过，缺少 GT：{gt_path}")
+                    continue
+
+                pred_reader_writer = get_reader_writer(str(pred_path))
+                pred, pred_props = pred_reader_writer.read_images([str(pred_path)])
+
+                gt_reader_writer = get_reader_writer(str(gt_path))
+                gt, gt_props = gt_reader_writer.read_images([str(gt_path)])
+
+                pred_3d = np.asarray(pred)
+                gt_3d = np.asarray(gt)
+
+                if pred_3d.shape != gt_3d.shape:
+                    raise ValueError(f"{filename}: 预测形状 {pred_3d.shape} 与 GT 形状 {gt_3d.shape} 不一致")
+
+                dice, iou = dice_iou(pred_3d, gt_3d)
+                hd, asd_val = compute_boundary_metrics(pred_3d,gt_3d,spacing=gt_props["spacing"])
+
+                values = [float(dice),float(iou),float(hd),float(asd_val)]
+                metric_values.append(values)
+
+                writer.writerow([filename, prompts[0], *values])
+                f.flush()
+
+                print(f"[{sequence}] {filename} dice: {dice:.4f}, iou: {iou:.4f}, hd: {hd:.4f}, asd: {asd_val:.4f}")
+
+            if not metric_values:
+                print(f"{sequence}: 没有成功计算任何病例")
+                continue
+
+            means = np.mean(np.asarray(metric_values), axis=0)
+            writer.writerow(["MEAN", prompts[0], *means])
+
+        print(
+            f"\n[{sequence}] n={len(metric_values)}, "
+            f"dice: {means[0]:.4f}, "
+            f"iou: {means[1]:.4f}, "
+            f"hd: {means[2]:.4f}, "
+            f"asd: {means[3]:.4f}, "
+            f"CSV: {csv_path}\n"
+        )
+
+def predict_single():
+    prompts = ["liver"]
+    sequences = ["AP", "DWI", "IN", "OPP", "PRE", "PVP", "T2WI", "TP"]
+    # sequences=['HBP']
+    device = torch.device("cuda:0")
+    model_path = Path("/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/model")
+    predictor = VoxTellPredictor(model_dir=str(model_path),text_encoding_model="/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/model/Qwen3-Embedding-4B",device=device)
+
+    data_root = Path("/data/hilab/datasets/WCH_MRI145")
+    output_folder = Path("/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/WCH_MREI145_predict/liver")
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    for sequence in sequences:
+        input_dir = data_root / sequence / "images"
+        mask_dir = data_root / sequence / "liver"
+        sub_output = output_folder / sequence
+        sub_output.mkdir(parents=True, exist_ok=True)
+
+        filenames = sorted(p.name for p in input_dir.glob("*.nii.gz") if p.is_file())
+        if not filenames:
+            print(f"{sequence}: 没有找到 .nii.gz 文件")
+            continue
+
+        # 每个序列单独统计
+        metric_values = []
+        csv_path = sub_output / "metrics.csv"
+
+        # w 表示每次运行覆盖该序列原有的 CSV
+        with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["filename", "prompt", "dice", "iou", "hd", "asd"])
+            f.flush()
+
+            for filename in filenames:
+                image_path = input_dir / filename
+                gt_path = mask_dir / filename
+
+                if not gt_path.is_file():
+                    raise FileNotFoundError(f"缺少 GT: {gt_path}")
+
+                reader_writer = get_reader_writer(str(image_path))
+                img, props = reader_writer.read_images([str(image_path)])
+
+                with torch.inference_mode():
+                    segmentation = predictor.predict_single_image(img, prompts)  # [1, D, H, W]
+                save_segmentation(segmentation[0],sub_output,filename,props,suffix="nii.gz")
+
+                gt, _ = reader_writer.read_images([str(gt_path)])
+
+                # 单个 prompt：取出对应的三维预测和 GT
+                pred_3d = np.asarray(segmentation)
+                gt_3d = np.asarray(gt)
+
+                if pred_3d.shape != gt_3d.shape:
+                    raise ValueError(f"{filename}: 预测形状 {pred_3d.shape}与 GT 形状 {gt_3d.shape} 不一致")
+
+                dice, iou = dice_iou(pred_3d, gt_3d)
+                hd, asd_val = compute_boundary_metrics(pred_3d,gt_3d,spacing=props["spacing"])
+
+                values = [float(dice),float(iou),float(hd),float(asd_val)]
+                metric_values.append(values)
+
+                writer.writerow([filename, prompts[0], *values])
+                f.flush()  # 已完成病例立即写入文件
+
+                print(f"[{sequence}] {filename} dice: {dice:.4f}, iou: {iou:.4f}, hd: {hd:.4f}, asd: {asd_val:.4f}")
+
+            means = np.mean(np.asarray(metric_values), axis=0)
+            writer.writerow(["MEAN", prompts[0], *means])
+
+        print(f"\n[{sequence}] n={len(metric_values)}, dice: {means[0]:.4f}, iou: {means[1]:.4f}, hd: {means[2]:.4f}, asd: {means[3]:.4f}, CSV: {csv_path}\n")
+
+def predict_single_192():
+    prompts = ["liver cancer"]
+    device = torch.device("cuda:0")
+
+    model_path = Path(
+        "/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/model"
+    )
+    predictor = VoxTellPredictor(
+        model_dir=str(model_path),
+        text_encoding_model=str(
+            model_path / "Qwen3-Embedding-4B"
+        ),
+        device=device,
+    )
+    predictor.network.eval()
+
+    # preprocess_voxtell_192.py生成的npz目录
+    preprocessed_dir = Path(
+        "/home/ubuntu/zy/pythoncode/sfda/CM-TTA/"
+        "output/voxtell_192/HBP/preprocess/cases"
+    )
+
+    output_folder = Path(
+        "/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/"
+        "WCH_MRI145_predict_192"
+    )
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    npz_files = sorted(preprocessed_dir.glob("*.npz"))
+    if not npz_files:
+        raise FileNotFoundError(
+            f"没有找到预处理后的npz文件：{preprocessed_dir}"
+        )
+
+    # 固定预训练文本特征，不进行TTA
+    with torch.inference_mode():
+        text_feature = predictor.embed_text_prompts(prompts).detach()
+
+    # 当前实验要求VoxTell窗口为192^3
+    patch_size = tuple(int(v) for v in predictor.patch_size)
+    if patch_size != (192, 192, 192):
+        raise ValueError(
+            f"VoxTell patch_size={patch_size}，预期为(192,192,192)"
+        )
+
+    metric_values = []
+    csv_path = output_folder / "metrics_192.csv"
+
+    with csv_path.open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "filename",
+            "prompt",
+            "dice",
+            "iou",
+            "pred_foreground_voxels",
+            "gt_foreground_voxels",
+        ])
+        f.flush()
+
+        for index, npz_path in enumerate(npz_files, start=1):
+            with np.load(npz_path, allow_pickle=False) as archive:
+                image_192 = archive["image_192"].astype(
+                    np.float32, copy=False
+                )
+                gt_192 = archive["gt_192"].astype(
+                    np.uint8, copy=False
+                )
+                case_id = str(archive["case_id"].item())
+
+            if image_192.shape != (1, 192, 192, 192):
+                raise ValueError(
+                    f"{npz_path.name}: image_192形状错误："
+                    f"{image_192.shape}"
+                )
+            if gt_192.shape != (1, 192, 192, 192):
+                raise ValueError(
+                    f"{npz_path.name}: gt_192形状错误："
+                    f"{gt_192.shape}"
+                )
+
+            image_tensor = torch.from_numpy(
+                image_192
+            ).float().contiguous()
+
+            # image_192已经完成裁剪、标准化和缩放，
+            # 不再调用predict_single_image/preprocess
+            with torch.inference_mode():
+                logits = predictor.predict_sliding_window_return_logits(
+                    image_tensor,
+                    text_feature.to(predictor.device),
+                ).float().cpu()
+
+                probability = torch.sigmoid(logits)
+
+            # 去除前导的batch/prompt单例维度，得到[D,H,W]
+            while (
+                probability.ndim > 3
+                and probability.shape[0] == 1
+            ):
+                probability = probability[0]
+
+            if tuple(probability.shape) != (192, 192, 192):
+                raise ValueError(
+                    f"{case_id}: 输出形状错误："
+                    f"{tuple(probability.shape)}"
+                )
+
+            pred_3d = (
+                probability.numpy() >= 0.5
+            ).astype(np.uint8)
+            gt_3d = gt_192[0]
+
+            dice, iou = dice_iou(pred_3d[None, ...], gt_192)
+
+            pred_voxels = int(np.count_nonzero(pred_3d))
+            gt_voxels = int(np.count_nonzero(gt_3d))
+
+            metric_values.append([
+                float(dice),
+                float(iou),
+            ])
+
+            writer.writerow([
+                f"{case_id}.nii.gz",
+                prompts[0],
+                float(dice),
+                float(iou),
+                pred_voxels,
+                gt_voxels,
+            ])
+            f.flush()
+
+            # 192^3结果直接保存为npy，避免错误套用原图affine
+            np.save(
+                output_folder / f"{case_id}_pred_192.npy",
+                pred_3d,
+            )
+            np.save(
+                output_folder / f"{case_id}_probability_192.npy",
+                probability.numpy().astype(np.float32),
+            )
+
+            print(
+                f"[{index}/{len(npz_files)}] {case_id}: "
+                f"dice={dice:.4f}, iou={iou:.4f}, "
+                f"pred_fg={pred_voxels}, gt_fg={gt_voxels}"
+            )
+
+        means = np.mean(
+            np.asarray(metric_values, dtype=np.float64),
+            axis=0,
+        )
+        writer.writerow([
+            "MEAN",
+            prompts[0],
+            float(means[0]),
+            float(means[1]),
+            "",
+            "",
+        ])
+
+    print(
+        f"\nn={len(metric_values)}, "
+        f"dice={means[0]:.4f}, "
+        f"iou={means[1]:.4f}, "
+        f"CSV={csv_path}"
+    )
+
+import csv
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+def _bbox_from_mask(mask: np.ndarray):
+    """
+    mask: [D, H, W] bool
+    return:
+        start: [d0, h0, w0]
+        end:   [d1, h1, w1]，右开区间
+    """
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+
+    start = coords.min(axis=0)
+    end = coords.max(axis=0) + 1
+    return start.astype(int), end.astype(int)
+
+
+def _expand_bbox(start, end, margin, shape):
+    start = np.asarray(start, dtype=int)
+    end = np.asarray(end, dtype=int)
+    shape = np.asarray(shape, dtype=int)
+
+    start = np.maximum(start - margin, 0)
+    end = np.minimum(end + margin, shape)
+
+    return start, end
+
+
+def _required_margin_to_cover(liver_bbox, tumor_bbox):
+    """
+    计算从 liver bbox 向六个方向做“统一对称扩张”时，
+    至少需要多少 voxel 才能完整包含 tumor bbox。
+    """
+    liver_start, liver_end = liver_bbox
+    tumor_start, tumor_end = tumor_bbox
+
+    need_before = np.maximum(liver_start - tumor_start, 0)
+    need_after = np.maximum(tumor_end - liver_end, 0)
+
+    # 六个方向中最大的扩张量
+    required_margin = int(max(need_before.max(), need_after.max()))
+
+    return required_margin, need_before, need_after
+
+
+def predict_liver_and_check_tumor_roi():
+    prompts = ["liver"]
+    sequences = ["HBP"]
+
+    device = torch.device("cuda:0")
+
+    model_path = Path(
+        "/home/ubuntu/zy/pythoncode/sfda/VoxTell_from_disk/model"
+    )
+    text_model = (
+        "/home/ubuntu/zy/pythoncode/sfda/"
+        "VoxTell_from_disk/model/Qwen3-Embedding-4B"
+    )
+
+    predictor = VoxTellPredictor(
+        model_dir=str(model_path),
+        text_encoding_model=text_model,
+        device=device,
+    )
+
+    data_root = Path("/data/hilab/datasets/WCH_MRI145")
+
+    output_root = Path(
+        "/home/ubuntu/zy/pythoncode/sfda/"
+        "VoxTell_from_disk/WCH_MREI145_predict/liver_roi"
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    # “完全包住 tumor 后，再额外扩 10 voxel”
+    extra_margin = 10
+
+    # 根据你的 tumor GT 标签修改。
+    # 如果当前 label 是二值 tumor mask，保持 (1,) 即可。
+    tumor_labels = (1,)
+
+    for sequence in sequences:
+        input_dir = data_root / sequence / "images"
+        tumor_mask_dir = data_root / sequence / "labels"
+
+        sequence_output = output_root / sequence
+        liver_output = sequence_output / "liver_prediction"
+
+        sequence_output.mkdir(parents=True, exist_ok=True)
+        liver_output.mkdir(parents=True, exist_ok=True)
+
+        filenames = sorted(
+            p.name for p in input_dir.glob("*.nii.gz") if p.is_file()
+        )
+
+        if not filenames:
+            print(f"{sequence}: 没有找到 .nii.gz 文件")
+            continue
+
+        csv_path = sequence_output / "liver_tumor_roi_check.csv"
+
+        with csv_path.open(
+            "w", newline="", encoding="utf-8-sig"
+        ) as f:
+            writer = csv.writer(f)
+
+            writer.writerow([
+                "filename",
+                "liver_empty",
+                "tumor_empty",
+
+                "tumor_voxels",
+                "tumor_inside_liver_voxels",
+                "tumor_inside_liver_ratio",
+
+                "required_margin",
+
+                "liver_d0", "liver_d1",
+                "liver_h0", "liver_h1",
+                "liver_w0", "liver_w1",
+
+                "oracle_d0", "oracle_d1",
+                "oracle_h0", "oracle_h1",
+                "oracle_w0", "oracle_w1",
+
+                "oracle_size_d",
+                "oracle_size_h",
+                "oracle_size_w",
+            ])
+
+            for index, filename in enumerate(filenames, start=1):
+                image_path = input_dir / filename
+                tumor_path = tumor_mask_dir / filename
+
+                if not tumor_path.is_file():
+                    raise FileNotFoundError(
+                        f"缺少 tumor GT: {tumor_path}"
+                    )
+
+                reader_writer = get_reader_writer(str(image_path))
+
+                img, props = reader_writer.read_images(
+                    [str(image_path)]
+                )
+
+                # img: [C, D, H, W]
+                with torch.inference_mode():
+                    segmentation = predictor.predict_single_image(
+                        img,
+                        prompts,
+                    )
+
+                # 保存原始 liver prediction
+                save_segmentation(
+                    segmentation[0],
+                    liver_output,
+                    filename,
+                    props,
+                    suffix="nii.gz",
+                )
+
+                # segmentation 通常 [1, D, H, W]
+                liver_pred = np.asarray(segmentation)
+                liver_pred = np.squeeze(liver_pred) > 0
+
+                tumor_gt, _ = reader_writer.read_images(
+                    [str(tumor_path)]
+                )
+                tumor_gt = np.squeeze(np.asarray(tumor_gt))
+
+                tumor_mask = np.isin(
+                    np.rint(tumor_gt).astype(np.int64),
+                    tumor_labels,
+                )
+
+                if liver_pred.shape != tumor_mask.shape:
+                    raise ValueError(
+                        f"{filename}: liver shape "
+                        f"{liver_pred.shape} != tumor shape "
+                        f"{tumor_mask.shape}"
+                    )
+
+                liver_bbox = _bbox_from_mask(liver_pred)
+                tumor_bbox = _bbox_from_mask(tumor_mask)
+
+                liver_empty = liver_bbox is None
+                tumor_empty = tumor_bbox is None
+
+                tumor_voxels = int(tumor_mask.sum())
+
+                if tumor_voxels > 0:
+                    tumor_inside = int(
+                        np.logical_and(
+                            tumor_mask,
+                            liver_pred,
+                        ).sum()
+                    )
+                    coverage = tumor_inside / tumor_voxels
+                else:
+                    tumor_inside = 0
+                    coverage = np.nan
+
+                if liver_bbox is None:
+                    # 该病例 liver 模型完全失败。
+                    # 这里只做 oracle 诊断，不能用于正式 SFDA。
+                    if tumor_bbox is None:
+                        print(
+                            f"[{sequence}] {filename}: "
+                            "liver 和 tumor 都为空"
+                        )
+                        continue
+
+                    required_margin = -1
+
+                    oracle_start, oracle_end = _expand_bbox(
+                        tumor_bbox[0],
+                        tumor_bbox[1],
+                        extra_margin,
+                        liver_pred.shape,
+                    )
+
+                    liver_start = np.array([-1, -1, -1])
+                    liver_end = np.array([-1, -1, -1])
+
+                else:
+                    liver_start, liver_end = liver_bbox
+
+                    if tumor_bbox is None:
+                        required_margin = 0
+
+                    else:
+                        required_margin, _, _ = (
+                            _required_margin_to_cover(
+                                liver_bbox,
+                                tumor_bbox,
+                            )
+                        )
+
+                    # 完全覆盖 tumor 所需 margin + 再额外 10 voxel
+                    final_margin = (
+                        required_margin + extra_margin
+                    )
+
+                    oracle_start, oracle_end = _expand_bbox(
+                        liver_start,
+                        liver_end,
+                        final_margin,
+                        liver_pred.shape,
+                    )
+
+                oracle_size = oracle_end - oracle_start
+
+                writer.writerow([
+                    filename,
+                    int(liver_empty),
+                    int(tumor_empty),
+
+                    tumor_voxels,
+                    tumor_inside,
+                    coverage,
+
+                    required_margin,
+
+                    *[
+                        liver_start[0],
+                        liver_end[0],
+                        liver_start[1],
+                        liver_end[1],
+                        liver_start[2],
+                        liver_end[2],
+                    ],
+
+                    *[
+                        oracle_start[0],
+                        oracle_end[0],
+                        oracle_start[1],
+                        oracle_end[1],
+                        oracle_start[2],
+                        oracle_end[2],
+                    ],
+
+                    *oracle_size.tolist(),
+                ])
+
+                f.flush()
+
+                print(
+                    f"[{sequence}] "
+                    f"{index}/{len(filenames)} "
+                    f"{filename} | "
+                    f"tumor coverage={coverage:.4f} | "
+                    f"required_margin={required_margin} | "
+                    f"oracle crop={tuple(oracle_size)}"
+                )
+
+        print(
+            f"\n[{sequence}] ROI 检查完成: {csv_path}\n"
+        )
 
 if __name__ == '__main__':
     os.environ['HF_HUB_OFFLINE'] = '1'
-    predict_batch()
+    evaluate_saved_predictions()
+    # predict_single()
+    # predict_single_192()
