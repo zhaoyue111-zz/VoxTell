@@ -42,7 +42,9 @@ class VoxTellPredictor:
     """
 
     def __init__(self, model_dir: str, device: torch.device = torch.device('cuda'),
-                 text_encoding_model: str = 'Qwen/Qwen3-Embedding-4B') -> None:
+                 text_encoding_model: str = 'Qwen/Qwen3-Embedding-4B',
+                 text_device: torch.device | None = None,
+                 text_dtype: torch.dtype | None = None) -> None:
         """
         Initialize the VoxTell predictor.
 
@@ -50,6 +52,13 @@ class VoxTellPredictor:
             model_dir: Path to model directory containing plans.json and checkpoint.
             device: PyTorch device to use for inference (default: cuda).
             text_encoding_model: Pretrained text encoding model (Qwen/Qwen3-Embedding-4B).
+            text_device: Temporary device used for text encoding. Defaults to
+                ``device``. Text embeddings are moved back to ``device`` before
+                they are returned, so the segmentation network always receives
+                local tensors.
+            text_dtype: Optional storage/compute dtype used while loading the
+                text encoder. ``float16`` approximately halves Qwen-4B's
+                memory requirement on the text GPU.
 
         Raises:
             FileNotFoundError: If model files are not found.
@@ -57,6 +66,7 @@ class VoxTellPredictor:
         """
         # Device setup
         self.device = device
+        self.text_device = text_device if text_device is not None else device
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
         self.normalization = ZScoreNormalization(intensityproperties={})
@@ -67,7 +77,9 @@ class VoxTellPredictor:
 
         # Embedding model
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoding_model, padding_side='left', local_files_only=True)
-        self.text_backbone = AutoModel.from_pretrained(text_encoding_model, local_files_only=True).eval()
+        self.text_backbone = AutoModel.from_pretrained(
+            text_encoding_model, local_files_only=True, torch_dtype=text_dtype
+        ).eval()
         self.max_text_length = 8192
 
         # Load network settings
@@ -170,62 +182,29 @@ class VoxTellPredictor:
                                                   zip((sx, sy, sz), self.patch_size)]]))
         return slicers
 
-    # @torch.inference_mode()
-    # def embed_text_prompts(self, text_prompts: Union[List[str], str]) -> torch.Tensor:
-    #     """
-    #     Embed text prompts into vector representations.
-    #
-    #     This function converts free-text anatomical descriptions into embeddings
-    #     using the text backbone model.
-    #
-    #     Args:
-    #         text_prompts: Single text prompt or list of text prompts.
-    #
-    #     Returns:
-    #         Text embeddings tensor of shape (1, num_prompts, embedding_dim).
-    #     """
-    #     if isinstance(text_prompts, str):
-    #         text_prompts = [text_prompts]
-    #     n_prompts = len(text_prompts)
-    #     self.text_backbone = self.text_backbone.to(self.device)
-    #
-    #     text_prompts = wrap_with_instruction(text_prompts)
-    #     text_tokens = self.tokenizer(
-    #         text_prompts,
-    #         padding=True,
-    #         truncation=True,
-    #         max_length=self.max_text_length,
-    #         return_tensors="pt",
-    #     )
-    #     text_tokens = {k: v.to(self.device) for k, v in text_tokens.items()}
-    #     text_embed = self.text_backbone(**text_tokens)
-    #     embeddings = last_token_pool(text_embed.last_hidden_state, text_tokens['attention_mask'])
-    #     embeddings = embeddings.view(1, n_prompts, -1)
-    #     self.text_backbone = self.text_backbone.to('cpu')
-    #     empty_cache(self.device)
-    #     return embeddings
-
     @torch.inference_mode()
-    def embed_text_prompts(
-            self, text_prompts: Union[List[str], str]
-    ) -> torch.Tensor:
-        """返回形状为 (1, num_prompts, embedding_dim) 的文本 embedding。"""
+    def embed_text_prompts(self, text_prompts: Union[List[str], str]) -> torch.Tensor:
         if isinstance(text_prompts, str):
             text_prompts = [text_prompts]
 
         if not text_prompts:
-            raise ValueError("text_prompts 不能为空")
+            raise ValueError("text_prompts cannot be empty")
 
-        # 同一组 prompt 只编码一次，缓存保存在 CPU
+        # Retain the existing CPU cache: one prompt is normally embedded only
+        # once, and keeping the cached vector on CPU avoids pinning a GPU after
+        # the encoder itself has been released.
         cache_key = tuple(text_prompts)
         if not hasattr(self, "_text_embedding_cache"):
             self._text_embedding_cache = {}
+        if cache_key in self._text_embedding_cache:
+            return self._text_embedding_cache[cache_key].to(self.device)
 
-        if cache_key not in self._text_embedding_cache:
-            self.text_backbone = self.text_backbone.to("cpu")
-            self.text_backbone.eval()
-
-            wrapped_prompts = wrap_with_instruction(list(text_prompts))
+        # Keep the text backbone separate from the 3D network. In particular,
+        # a 4B text encoder can be placed on a second GPU while the latter is
+        # reserved for sliding-window inference.
+        self.text_backbone = self.text_backbone.to(self.text_device)
+        try:
+            wrapped_prompts = wrap_with_instruction(text_prompts)
             text_tokens = self.tokenizer(
                 wrapped_prompts,
                 padding=True,
@@ -233,22 +212,19 @@ class VoxTellPredictor:
                 max_length=self.max_text_length,
                 return_tensors="pt",
             )
-            text_tokens = {
-                k: v.to("cpu") for k, v in text_tokens.items()
-            }
-
+            text_tokens = {key: value.to(self.text_device) for key, value in text_tokens.items()}
             text_embed = self.text_backbone(**text_tokens)
             embeddings = last_token_pool(
-                text_embed.last_hidden_state,
-                text_tokens["attention_mask"],
-            )
-            embeddings = embeddings.reshape(1, len(text_prompts), -1)
-
-            # clone 避免缓存引用完整的 last_hidden_state 底层存储
-            self._text_embedding_cache[cache_key] = (
-                embeddings.detach().cpu().clone()
-            )
-
+                text_embed.last_hidden_state, text_tokens["attention_mask"]
+            ).reshape(1, len(text_prompts), -1)
+            # Clone before releasing ``text_embed`` so the cache cannot retain
+            # the complete last-hidden-state allocation.
+            self._text_embedding_cache[cache_key] = embeddings.detach().cpu().clone()
+        finally:
+            self.text_backbone = self.text_backbone.to("cpu")
+            if self.text_device.type == "cuda":
+                torch.cuda.synchronize(self.text_device)
+                empty_cache(self.text_device)
         return self._text_embedding_cache[cache_key].to(self.device)
 
     @torch.inference_mode()

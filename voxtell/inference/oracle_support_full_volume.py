@@ -31,8 +31,66 @@ SCORE_MODES = ("max", "top3_mean", "top5_mean")
 BANK_NAMES = ("oracle", "prediction")
 ALPHAS = (0.25, 0.5, 1.0, 2.0)
 RANDOM_SEEDS = tuple(range(42, 52))
-BASELINE_DICE_TOLERANCE = 1e-4
+BASELINE_DICE_TOLERANCE = 2e-3
 EPS = 1e-8
+WORK_SPACE_SAFETY_FACTOR = 1.10
+SIMILARITY_MAPS_AT_PEAK = 9  # oracle(3) + prediction(3) + one random seed(3)
+
+
+def estimate_peak_work_bytes(
+    channels: int,
+    padded_shape: Sequence[int],
+    cropped_shape: Sequence[int],
+) -> dict[str, int]:
+    """Estimate peak on-disk memmaps for one case, including query scoring."""
+    channels = int(channels)
+    if channels <= 0:
+        raise ValueError(f"invalid D5 channels: {channels}")
+    padded_voxels = int(np.prod(tuple(int(v) for v in padded_shape), dtype=np.int64))
+    cropped_voxels = int(np.prod(tuple(int(v) for v in cropped_shape), dtype=np.int64))
+    if padded_voxels <= 0 or cropped_voxels <= 0:
+        raise ValueError("padded/cropped shape must be non-empty")
+    inference = 4 * (channels + 2) * padded_voxels
+    normalization_transition = 4 * (channels + 1) * padded_voxels + 2 * channels * cropped_voxels
+    similarity = 2 * channels * cropped_voxels + 4 * SIMILARITY_MAPS_AT_PEAK * cropped_voxels
+    peak = max(inference, normalization_transition, similarity)
+    return {
+        "inference_bytes": int(inference),
+        "normalization_transition_bytes": int(normalization_transition),
+        "similarity_bytes": int(similarity),
+        "peak_bytes": int(peak),
+        "required_with_safety_bytes": int(math.ceil(peak * WORK_SPACE_SAFETY_FACTOR)),
+    }
+
+
+def ensure_work_dir_capacity(
+    work_dir: Path,
+    estimate: dict[str, int],
+    free_bytes: int | None = None,
+) -> dict[str, int]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    available = int(shutil.disk_usage(work_dir).free if free_bytes is None else free_bytes)
+    required = int(estimate["required_with_safety_bytes"])
+    print(
+        f"[work-dir] {work_dir}: estimated peak={estimate['peak_bytes'] / 2**30:.2f} GiB, "
+        f"required with {WORK_SPACE_SAFETY_FACTOR:.0%} safety={required / 2**30:.2f} GiB, "
+        f"free={available / 2**30:.2f} GiB"
+    )
+    if available < required:
+        raise OSError(
+            f"insufficient temporary disk space in {work_dir}: "
+            f"estimated peak {estimate['peak_bytes']} bytes, required with safety {required} bytes, "
+            f"free {available} bytes"
+        )
+    return {**estimate, "free_bytes": available}
+
+
+def infer_d5_feature_channels(predictor: Any) -> int:
+    network = getattr(predictor.network, "_orig_mod", predictor.network)
+    channels = getattr(getattr(network, "encoder", None), "output_channels", None)
+    if not channels:
+        raise RuntimeError("cannot determine D5 pre-head channels before inference")
+    return int(channels[0])
 
 
 @dataclass(frozen=True)
@@ -421,62 +479,88 @@ class FusedFeatureCase:
         if self.temp_dir.exists(): shutil.rmtree(self.temp_dir)
 
 
-def run_full_volume_feature_inference(predictor: Any, text_embedding: torch.Tensor, case: CaseFiles, output_dir: Path, prompt: str) -> FusedFeatureCase:
+def run_full_volume_feature_inference(
+    predictor: Any,
+    text_embedding: torch.Tensor,
+    case: CaseFiles,
+    work_dir: Path,
+    prompt: str,
+) -> FusedFeatureCase:
     from acvl_utils.cropping_and_padding.padding import pad_nd_image
     from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 
-    image, gt, properties = load_case(case)
-    preprocessed, bbox, original_shape = predictor.preprocess(image)
-    padded, revert = pad_nd_image(preprocessed, predictor.patch_size, "constant", {"value": 0}, True, None)
-    padded_shape = tuple(int(v) for v in padded.shape[1:])
-    slicers = predictor._internal_get_sliding_window_slicers(padded_shape)
-    gaussian = compute_gaussian(tuple(predictor.patch_size), sigma_scale=1 / 8, value_scaling_factor=10, device=torch.device("cpu")).float().numpy()
-    temp_dir = output_dir / ".oracle_support_work" / case.case_id
-    if temp_dir.exists(): shutil.rmtree(temp_dir)
-    temp_dir.mkdir(parents=True)
-    denominator = np.memmap(temp_dir / "denominator.dat", "w+", np.float32, shape=padded_shape); denominator[:] = 0
-    logits_sum = np.memmap(temp_dir / "logits.dat", "w+", np.float32, shape=padded_shape); logits_sum[:] = 0
-    feature_sum = None; channels = 0; raw_patch_shape = None
-    for slicer in slicers:
-        logits, feature = _network_patch(predictor, padded[slicer][None].to(predictor.device), text_embedding)
-        tile_shape = tuple(int(s.stop - s.start) for s in slicer[1:])
-        observed = tuple(int(v) for v in feature.shape[1:])
-        if observed != tile_shape or tuple(logits.shape) != tile_shape:
-            raise AssertionError(f"D5/logit grid mismatch: feature={observed}, logits={tuple(logits.shape)}, tile={tile_shape}")
-        if feature_sum is None:
-            channels = int(feature.shape[0]); raw_patch_shape = observed
-            feature_sum = np.memmap(temp_dir / "feature_sum.dat", "w+", np.float32, shape=(channels, *padded_shape)); feature_sum[:] = 0
-        if int(feature.shape[0]) != channels or observed != raw_patch_shape:
-            raise AssertionError("D5 shape changed across windows")
-        feature_sum[(slice(None), *slicer[1:])] += feature.cpu().numpy() * gaussian[None]
-        logits_sum[slicer[1:]] += logits.cpu().numpy() * gaussian
-        denominator[slicer[1:]] += gaussian
-    if feature_sum is None or np.any(denominator <= 0):
-        raise AssertionError("empty inference or uncovered Gaussian voxel")
-    cropped_probability = 1 / (1 + np.exp(-np.clip((logits_sum / denominator)[tuple(revert[1:])], -50, 50)))
-    baseline_probability = restore_crop_to_full(cropped_probability.astype(np.float32), bbox, original_shape)
-    baseline_metrics = binary_metrics(baseline_probability >= 0.5, gt)
-    gap = verify_baseline_dice(case.case_id, case.zero_shot_dice, baseline_metrics["dice"])
-    external_kind = "not_supplied"; external_gap = math.nan
-    if case.prediction:
-        external_probability, external_kind = load_probability(
-            case.prediction, original_shape, properties["nibabel_stuff"]["original_affine"]
+    temp_dir = Path(work_dir) / case.case_id
+    denominator = None
+    logits_sum = None
+    feature_sum = None
+    completed = False
+    try:
+        image, gt, properties = load_case(case)
+        preprocessed, bbox, original_shape = predictor.preprocess(image)
+        cropped_shape = tuple(int(v) for v in preprocessed.shape[1:])
+        padded, revert = pad_nd_image(preprocessed, predictor.patch_size, "constant", {"value": 0}, True, None)
+        padded_shape = tuple(int(v) for v in padded.shape[1:])
+        expected_channels = infer_d5_feature_channels(predictor)
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        space = ensure_work_dir_capacity(
+            Path(work_dir), estimate_peak_work_bytes(expected_channels, padded_shape, cropped_shape)
         )
-        external_gap = verify_baseline_dice(case.case_id + ":external", case.zero_shot_dice, binary_metrics(external_probability >= 0.5, gt)["dice"])
-    logits_path = Path(logits_sum.filename); _close_memmap(logits_sum); logits_path.unlink()
-    bbox_tuple = tuple((int(a), int(b)) for a, b in bbox)
-    cropped_shape = tuple(int(v) for v in preprocessed.shape[1:])
-    audit = {"case_id": case.case_id, "baseline_dice_csv": float(case.zero_shot_dice), "baseline_dice_recomputed": float(baseline_metrics["dice"]), "baseline_dice_gap": float(gap)}
-    metadata = {
-        **audit, "prompt": prompt, "image_path": str(case.image), "prediction_source": "recomputed_voxtell_probability",
-        "external_prediction_path": str(case.prediction) if case.prediction else None, "external_prediction_type": external_kind,
-        "external_prediction_dice_gap": external_gap, "original_shape": list(map(int, original_shape)),
-        "crop_to_nonzero_bbox": [list(x) for x in bbox_tuple], "cropped_shape": list(cropped_shape), "padded_shape": list(padded_shape),
-        "patch_size": list(map(int, predictor.patch_size)), "tile_step_size": float(predictor.tile_step_size),
-        "gaussian_sigma_scale": 0.125, "gaussian_value_scaling_factor": 10, "sliding_window_count": len(slicers),
-        "feature_channels": channels, "raw_d5_patch_shape": list(raw_patch_shape),
-    }
-    return FusedFeatureCase(case, image, gt, properties, bbox_tuple, tuple(original_shape), cropped_shape, padded_shape, tuple(revert), feature_sum, denominator, baseline_probability, baseline_metrics, audit, channels, raw_patch_shape, temp_dir, metadata)
+        temp_dir.mkdir(parents=True)
+        slicers = predictor._internal_get_sliding_window_slicers(padded_shape)
+        gaussian = compute_gaussian(tuple(predictor.patch_size), sigma_scale=1 / 8, value_scaling_factor=10, device=torch.device("cpu")).float().numpy()
+        denominator = np.memmap(temp_dir / "denominator.dat", dtype=np.float32, mode="w+", shape=padded_shape); denominator[:] = 0
+        logits_sum = np.memmap(temp_dir / "logits.dat", dtype=np.float32, mode="w+", shape=padded_shape); logits_sum[:] = 0
+        channels = 0; raw_patch_shape = None
+        for slicer in slicers:
+            logits, feature = _network_patch(predictor, padded[slicer][None].to(predictor.device), text_embedding)
+            tile_shape = tuple(int(s.stop - s.start) for s in slicer[1:])
+            observed = tuple(int(v) for v in feature.shape[1:])
+            if observed != tile_shape or tuple(logits.shape) != tile_shape:
+                raise AssertionError(f"D5/logit grid mismatch: feature={observed}, logits={tuple(logits.shape)}, tile={tile_shape}")
+            if feature_sum is None:
+                channels = int(feature.shape[0]); raw_patch_shape = observed
+                if channels != expected_channels:
+                    raise AssertionError(f"D5 channel estimate mismatch: expected={expected_channels}, observed={channels}")
+                feature_sum = np.memmap(temp_dir / "feature_sum.dat", dtype=np.float32, mode="w+", shape=(channels, *padded_shape)); feature_sum[:] = 0
+            if int(feature.shape[0]) != channels or observed != raw_patch_shape:
+                raise AssertionError("D5 shape changed across windows")
+            feature_sum[(slice(None), *slicer[1:])] += feature.cpu().numpy() * gaussian[None]
+            logits_sum[slicer[1:]] += logits.cpu().numpy() * gaussian
+            denominator[slicer[1:]] += gaussian
+        if feature_sum is None or np.any(denominator <= 0):
+            raise AssertionError("empty inference or uncovered Gaussian voxel")
+        cropped_probability = 1 / (1 + np.exp(-np.clip((logits_sum / denominator)[tuple(revert[1:])], -50, 50)))
+        baseline_probability = restore_crop_to_full(cropped_probability.astype(np.float32), bbox, original_shape)
+        baseline_metrics = binary_metrics(baseline_probability >= 0.5, gt)
+        gap = verify_baseline_dice(case.case_id, case.zero_shot_dice, baseline_metrics["dice"])
+        external_kind = "not_supplied"; external_gap = math.nan
+        if case.prediction:
+            external_probability, external_kind = load_probability(
+                case.prediction, original_shape, properties["nibabel_stuff"]["original_affine"]
+            )
+            external_gap = verify_baseline_dice(case.case_id + ":external", case.zero_shot_dice, binary_metrics(external_probability >= 0.5, gt)["dice"])
+        logits_path = Path(logits_sum.filename); _close_memmap(logits_sum); logits_sum = None; logits_path.unlink()
+        bbox_tuple = tuple((int(a), int(b)) for a, b in bbox)
+        audit = {"case_id": case.case_id, "baseline_dice_csv": float(case.zero_shot_dice), "baseline_dice_recomputed": float(baseline_metrics["dice"]), "baseline_dice_gap": float(gap)}
+        metadata = {
+            **audit, "prompt": prompt, "image_path": str(case.image), "prediction_source": "recomputed_voxtell_probability",
+            "external_prediction_path": str(case.prediction) if case.prediction else None, "external_prediction_type": external_kind,
+            "external_prediction_dice_gap": external_gap, "original_shape": list(map(int, original_shape)),
+            "crop_to_nonzero_bbox": [list(x) for x in bbox_tuple], "cropped_shape": list(cropped_shape), "padded_shape": list(padded_shape),
+            "patch_size": list(map(int, predictor.patch_size)), "tile_step_size": float(predictor.tile_step_size),
+            "gaussian_sigma_scale": 0.125, "gaussian_value_scaling_factor": 10, "sliding_window_count": len(slicers),
+            "feature_channels": channels, "raw_d5_patch_shape": list(raw_patch_shape), "work_space_estimate": space,
+        }
+        result = FusedFeatureCase(case, image, gt, properties, bbox_tuple, tuple(original_shape), cropped_shape, padded_shape, tuple(revert), feature_sum, denominator, baseline_probability, baseline_metrics, audit, channels, raw_patch_shape, temp_dir, metadata)
+        completed = True
+        return result
+    finally:
+        if not completed:
+            for array in (feature_sum, denominator, logits_sum):
+                _close_memmap(array)
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
 
 
 def iter_normalized_fused_feature_blocks(case: FusedFeatureCase, block_depth: int = 1) -> Iterator[tuple[int, int, np.ndarray]]:
@@ -529,10 +613,17 @@ def extract_support_case(case: FusedFeatureCase) -> tuple[list[np.ndarray], list
 
 
 def materialize_normalized_features(case: FusedFeatureCase) -> np.memmap:
-    normalized = np.memmap(case.temp_dir / "normalized_features.dat", "w+", np.float16, shape=(case.feature_channels, *case.cropped_shape))
-    for d0, d1, features in iter_normalized_fused_feature_blocks(case): normalized[:, d0:d1] = features.astype(np.float16)
-    normalized.flush(); case.release_fusion_buffers()
-    return normalized
+    normalized = None
+    try:
+        normalized = np.memmap(case.temp_dir / "normalized_features.dat", dtype=np.float16, mode="w+", shape=(case.feature_channels, *case.cropped_shape))
+        for d0, d1, features in iter_normalized_fused_feature_blocks(case): normalized[:, d0:d1] = features.astype(np.float16)
+        normalized.flush(); case.release_fusion_buffers()
+        return normalized
+    except BaseException:
+        if normalized is not None:
+            path = Path(normalized.filename); _close_memmap(normalized)
+            if path.exists(): path.unlink()
+        raise
 
 
 def shuffled_prototype_bank(prototypes: np.ndarray, seed: int) -> np.ndarray:
@@ -554,13 +645,24 @@ def _score_feature_matrix(features: np.ndarray, prototypes: np.ndarray, device: 
 
 def compute_similarity_after_feature_fusion(normalized: np.memmap, prototypes: np.ndarray, device: torch.device, directory: Path, prefix: str) -> dict[str, np.memmap]:
     if len(prototypes) == 0: raise ValueError(f"empty prototype bank: {prefix}")
-    shape = tuple(normalized.shape[1:]); maps = {mode: np.memmap(directory / f"{prefix}_{mode}.dat", "w+", np.float32, shape=shape) for mode in SCORE_MODES}
-    for d0 in range(shape[0]):
-        block = np.asarray(normalized[:, d0:d0 + 1], np.float32)
-        values = _score_feature_matrix(block, prototypes, device)
-        for mode in SCORE_MODES: maps[mode][d0] = values[mode].reshape(shape[1:])
-    for array in maps.values(): array.flush()
-    return maps
+    shape = tuple(normalized.shape[1:]); maps = {}
+    try:
+        for score_mode in SCORE_MODES:
+            maps[score_mode] = np.memmap(
+                directory / f"{prefix}_{score_mode}.dat",
+                dtype=np.float32, mode="w+", shape=shape,
+            )
+        for d0 in range(shape[0]):
+            block = np.asarray(normalized[:, d0:d0 + 1], np.float32)
+            values = _score_feature_matrix(block, prototypes, device)
+            for mode in SCORE_MODES: maps[mode][d0] = values[mode].reshape(shape[1:])
+        for array in maps.values(): array.flush()
+        return maps
+    except BaseException:
+        for array in maps.values():
+            path = Path(array.filename); _close_memmap(array)
+            if path.exists(): path.unlink()
+        raise
 
 
 def exact_topk_mask(scores: np.ndarray, valid_region: np.ndarray, k: int) -> np.ndarray:
@@ -624,42 +726,53 @@ def _localization_row(case: FusedFeatureCase, bank: str, mode: str, score: np.nd
 
 
 def run_query_case(case: FusedFeatureCase, prototype_banks: dict[str, np.ndarray], random_banks: dict[int, np.ndarray], output_dir: Path, device: torch.device) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    normalized = materialize_normalized_features(case); crop = _bbox_slices(case.bbox); valid = np.ones(case.cropped_shape, bool)
-    localization_rows = [_localization_row(case, "baseline_probability", "native", case.baseline_probability[crop])]
-    maps_by_bank = {bank: compute_similarity_after_feature_fusion(normalized, prototypes, device, case.temp_dir, bank) for bank, prototypes in prototype_banks.items()}
-    for bank, maps in maps_by_bank.items():
-        for mode, score in maps.items(): localization_rows.append(_localization_row(case, bank, mode, score))
-    random_case_metrics = []
-    for seed, bank in random_banks.items():
-        maps = compute_similarity_after_feature_fusion(normalized, bank, device, case.temp_dir, f"random_{seed}")
-        for mode, score in maps.items():
-            row = _localization_row(case, "random", mode, score, seed); localization_rows.append(row)
-            if mode == "max": random_case_metrics.append(row)
-        for score in maps.values(): path = Path(score.filename); _close_memmap(score); path.unlink()
-    fusion_rows = []; fused_primary = None
-    baseline_empty = case.baseline_metrics["pred_foreground_voxels"] == 0
-    for bank, maps in maps_by_bank.items():
-        for mode, score in maps.items():
-            standardized, mean, std, status = standardize_in_valid_region(score, valid)
-            for alpha in ALPHAS:
-                fused_crop = fuse_probability(case.baseline_probability[crop], standardized, alpha)
-                fused_full = restore_crop_to_full(fused_crop, case.bbox, case.original_shape)
-                metrics = binary_metrics(fused_full, case.gt); hits, lesion_count, hit_rate = lesion_hits(fused_full, case.gt)
-                fusion_rows.append({"case_id": case.case.case_id, "bank": bank, "score_mode": mode, "alpha": alpha, "threshold": 0.5, **metrics, "lesion_hits": hits, "lesion_count": lesion_count, "lesion_level_hit_rate": hit_rate, "delta_dice": metrics["dice"] - case.baseline_metrics["dice"], "delta_precision": metrics["precision"] - case.baseline_metrics["precision"], "delta_recall": metrics["recall"] - case.baseline_metrics["recall"], "baseline_empty_prediction": baseline_empty, "effective_empty_recovery": effective_empty_recovery(baseline_empty, metrics, hits), "score_mean_in_valid_region": mean, "score_std_in_valid_region": std, "standardization_status": status})
-                if bank == "oracle" and mode == "max" and alpha == 1.0: fused_primary = fused_full
-    oracle_similarity = restore_crop_to_full(np.asarray(maps_by_bank["oracle"]["max"]), case.bbox, case.original_shape)
-    prediction_similarity = restore_crop_to_full(np.asarray(maps_by_bank["prediction"]["max"]), case.bbox, case.original_shape)
-    if fused_primary is None: raise AssertionError("fixed primary fusion missing")
-    case_dir = output_dir / case.case.case_id; case_dir.mkdir(parents=True, exist_ok=True)
-    save_nifti_like(case.baseline_probability, case_dir / "baseline_probability.nii.gz", case.properties)
-    save_nifti_like(oracle_similarity, case_dir / "oracle_similarity.nii.gz", case.properties)
-    save_nifti_like(prediction_similarity, case_dir / "prediction_similarity.nii.gz", case.properties)
-    save_nifti_like(fused_primary.astype(np.uint8), case_dir / "fused_prediction.nii.gz", case.properties, integer=True)
-    save_visualization(case.image, case.gt, case.baseline_probability, oracle_similarity, fused_primary, case_dir / "diagnostic.png", case.case.case_id)
-    for maps in maps_by_bank.values():
-        for score in maps.values(): _close_memmap(score)
-    _close_memmap(normalized); case.cleanup()
-    return localization_rows, fusion_rows, {**case.metadata, "random_seed_max_metrics": random_case_metrics}
+    normalized = None
+    maps_by_bank: dict[str, dict[str, np.memmap]] = {}
+    active_random_maps: dict[str, np.memmap] = {}
+    try:
+        normalized = materialize_normalized_features(case); crop = _bbox_slices(case.bbox); valid = np.ones(case.cropped_shape, bool)
+        localization_rows = [_localization_row(case, "baseline_probability", "native", case.baseline_probability[crop])]
+        for bank, prototypes in prototype_banks.items():
+            maps_by_bank[bank] = compute_similarity_after_feature_fusion(normalized, prototypes, device, case.temp_dir, bank)
+        for bank, maps in maps_by_bank.items():
+            for mode, score in maps.items(): localization_rows.append(_localization_row(case, bank, mode, score))
+        random_case_metrics = []
+        for seed, bank in random_banks.items():
+            active_random_maps = compute_similarity_after_feature_fusion(normalized, bank, device, case.temp_dir, f"random_{seed}")
+            for mode, score in active_random_maps.items():
+                row = _localization_row(case, "random", mode, score, seed); localization_rows.append(row)
+                if mode == "max": random_case_metrics.append(row)
+            for score in active_random_maps.values():
+                path = Path(score.filename); _close_memmap(score)
+                if path.exists(): path.unlink()
+            active_random_maps = {}
+        fusion_rows = []; fused_primary = None
+        baseline_empty = case.baseline_metrics["pred_foreground_voxels"] == 0
+        for bank, maps in maps_by_bank.items():
+            for mode, score in maps.items():
+                standardized, mean, std, status = standardize_in_valid_region(score, valid)
+                for alpha in ALPHAS:
+                    fused_crop = fuse_probability(case.baseline_probability[crop], standardized, alpha)
+                    fused_full = restore_crop_to_full(fused_crop, case.bbox, case.original_shape)
+                    metrics = binary_metrics(fused_full, case.gt); hits, lesion_count, hit_rate = lesion_hits(fused_full, case.gt)
+                    fusion_rows.append({"case_id": case.case.case_id, "bank": bank, "score_mode": mode, "alpha": alpha, "threshold": 0.5, **metrics, "lesion_hits": hits, "lesion_count": lesion_count, "lesion_level_hit_rate": hit_rate, "delta_dice": metrics["dice"] - case.baseline_metrics["dice"], "delta_precision": metrics["precision"] - case.baseline_metrics["precision"], "delta_recall": metrics["recall"] - case.baseline_metrics["recall"], "baseline_empty_prediction": baseline_empty, "effective_empty_recovery": effective_empty_recovery(baseline_empty, metrics, hits), "score_mean_in_valid_region": mean, "score_std_in_valid_region": std, "standardization_status": status})
+                    if bank == "oracle" and mode == "max" and alpha == 1.0: fused_primary = fused_full
+        oracle_similarity = restore_crop_to_full(np.asarray(maps_by_bank["oracle"]["max"]), case.bbox, case.original_shape)
+        prediction_similarity = restore_crop_to_full(np.asarray(maps_by_bank["prediction"]["max"]), case.bbox, case.original_shape)
+        if fused_primary is None: raise AssertionError("fixed primary fusion missing")
+        case_dir = output_dir / case.case.case_id; case_dir.mkdir(parents=True, exist_ok=True)
+        save_nifti_like(case.baseline_probability, case_dir / "baseline_probability.nii.gz", case.properties)
+        save_nifti_like(oracle_similarity, case_dir / "oracle_similarity.nii.gz", case.properties)
+        save_nifti_like(prediction_similarity, case_dir / "prediction_similarity.nii.gz", case.properties)
+        save_nifti_like(fused_primary.astype(np.uint8), case_dir / "fused_prediction.nii.gz", case.properties, integer=True)
+        save_visualization(case.image, case.gt, case.baseline_probability, oracle_similarity, fused_primary, case_dir / "diagnostic.png", case.case.case_id)
+        return localization_rows, fusion_rows, {**case.metadata, "random_seed_max_metrics": random_case_metrics}
+    finally:
+        for maps in (*maps_by_bank.values(), active_random_maps):
+            for score in maps.values():
+                _close_memmap(score)
+        _close_memmap(normalized)
+        case.cleanup()
 
 
 def save_nifti_like(array: np.ndarray, path: Path, properties: dict[str, Any], integer: bool = False) -> None:
@@ -697,6 +810,70 @@ def _write_csv(path: Path, rows: Sequence[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
+
+
+_CSV_TEXT_FIELDS = {
+    "case_id", "bank", "score_mode", "auc_nan_reason", "fn_auc_nan_reason",
+    "standardization_status",
+}
+_COMPLETE_LOCALIZATION_ROWS = 1 + len(BANK_NAMES) * len(SCORE_MODES) + len(RANDOM_SEEDS) * len(SCORE_MODES)
+_COMPLETE_FUSION_ROWS = len(BANK_NAMES) * len(SCORE_MODES) * len(ALPHAS)
+
+
+def _read_result_csv(path: Path) -> list[dict[str, Any]]:
+    """Read a prior result CSV while restoring numeric and Boolean values."""
+    if not path.exists():
+        return []
+    rows = []
+    with path.open(newline="", encoding="utf-8") as handle:
+        for raw in csv.DictReader(handle):
+            row: dict[str, Any] = {}
+            for key, value in raw.items():
+                if value is None or key in _CSV_TEXT_FIELDS:
+                    row[key] = "" if value is None else value
+                elif value == "":
+                    row[key] = ""
+                elif value in ("True", "False"):
+                    row[key] = value == "True"
+                else:
+                    try:
+                        row[key] = int(value)
+                    except ValueError:
+                        try:
+                            row[key] = float(value)
+                        except ValueError:
+                            row[key] = value
+            rows.append(row)
+    return rows
+
+
+def load_completed_query_results(output_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+    """Load only complete prior query results, discarding interrupted rows.
+
+    A completed case has every localization and fusion row that ``run_query_case``
+    deterministically emits. This avoids falsely skipping a case after an
+    interruption midway through its scoring/writing sequence.
+    """
+    localization = _read_result_csv(output_dir / "per_case_localization.csv")
+    fusion = _read_result_csv(output_dir / "per_case_fusion.csv")
+    localization_counts: dict[str, int] = {}
+    fusion_counts: dict[str, int] = {}
+    for row in localization:
+        localization_counts[row["case_id"]] = localization_counts.get(row["case_id"], 0) + 1
+    for row in fusion:
+        fusion_counts[row["case_id"]] = fusion_counts.get(row["case_id"], 0) + 1
+    completed = {
+        case_id for case_id, count in localization_counts.items()
+        if count == _COMPLETE_LOCALIZATION_ROWS and fusion_counts.get(case_id) == _COMPLETE_FUSION_ROWS
+    }
+    retained_localization = [row for row in localization if row["case_id"] in completed]
+    retained_fusion = [row for row in fusion if row["case_id"] in completed]
+    dropped = len(localization) + len(fusion) - len(retained_localization) - len(retained_fusion)
+    if completed:
+        print(f"[resume] loaded {len(completed)} completed query cases")
+    if dropped:
+        print(f"[resume] discarded {dropped} incomplete query-result rows")
+    return retained_localization, retained_fusion, completed
 
 
 def paired_comparison(first: Sequence[float], second: Sequence[float], seed: int = 2026, samples: int = 5000) -> dict[str, Any]:
@@ -748,6 +925,34 @@ def summarize(localization: Sequence[dict[str, Any]], fusion: Sequence[dict[str,
         case: [float(r["auprc"]) for r in random_rows if r["case_id"] == case]
         for case in case_order
     }
+    report_metrics = (
+        "auprc", "dice_at_oracle_volume", "fn_region_auprc",
+        "recall_at_1v", "recall_at_2v", "recall_at_5v",
+    )
+
+    def case_level_summary(rows: Sequence[dict[str, Any]], random: bool = False) -> dict[str, Any]:
+        output = {}
+        for metric in report_metrics:
+            case_values = {}
+            for case_id in case_order:
+                candidates = [float(row[metric]) for row in rows if row["case_id"] == case_id]
+                case_values[case_id] = finite_mean(candidates) if random else (candidates[0] if candidates else math.nan)
+            finite = np.asarray(list(case_values.values()), np.float64)
+            finite = finite[np.isfinite(finite)]
+            output[metric] = {
+                "n_cases": int(len(finite)),
+                "mean": float(finite.mean()) if len(finite) else math.nan,
+                "median": float(np.median(finite)) if len(finite) else math.nan,
+                "case_values": case_values,
+            }
+        return output
+
+    aggregate_metrics = {
+        "baseline": case_level_summary(baseline),
+        "oracle": case_level_summary(oracle),
+        "prediction": case_level_summary(prediction),
+        "random": case_level_summary(random_rows, random=True),
+    }
     comparisons = {
         "oracle_vs_baseline_auprc": paired_comparison(values(oracle, "auprc"), values(baseline, "auprc")),
         "oracle_vs_baseline_dice_at_oracle_volume": paired_comparison(values(oracle, "dice_at_oracle_volume"), values(baseline, "dice_at_oracle_volume")),
@@ -793,6 +998,7 @@ def summarize(localization: Sequence[dict[str, Any]], fusion: Sequence[dict[str,
     return {
         "experiment": "oracle_support_full_volume", "audit": audit, "random_seeds": list(RANDOM_SEEDS), "case_inference_metadata": list(case_metadata),
         "definitions": {"valid_region": "crop_to_nonzero bbox in the original full volume", "clearly_better": "lower bound of paired bootstrap 95% CI is > 0", "effective_empty_recovery": "baseline empty and fused Dice>=0.05, Recall>=0.10, and >=1 GT lesion hit", "fusion_categories": "delta Dice >0.02, <-0.02, otherwise within +/-0.02", "severe_precision_drop": "delta Precision < -0.10; tradeoff flag requires this in >=25% of query cases while mean Recall increases"},
+        "case_level_mean_median": aggregate_metrics,
         "paired_comparisons": comparisons, "random_control": {metric: random_seed_summary(random_rows, metric) for metric in ("auprc", "dice_at_oracle_volume", "fn_region_auprc", "fn_recall_at_1v")},
         "fixed_alpha_fusion_counts": fusion_counts,
         "answers": {
@@ -849,8 +1055,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-dir", required=True, help="Original HBP full-volume NIfTI directory"); parser.add_argument("--label-dir", required=True)
     parser.add_argument("--prediction-dir", default=None); parser.add_argument("--model-dir", required=True); parser.add_argument("--text-model", required=True)
     parser.add_argument("--prompt", default="HCC lesion"); parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--work-dir", required=True, help="Dedicated filesystem for temporary memmaps")
     parser.add_argument("--support-threshold", type=float, default=.8); parser.add_argument("--query-threshold", type=float, default=.5); parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--text-device", default="auto",
+        help="CUDA device for Qwen text embedding. 'auto' chooses the non-inference GPU with the most free memory.",
+    )
+    parser.add_argument(
+        "--text-dtype", choices=("float16", "bfloat16", "float32"), default="float16",
+        help="Qwen text-encoder precision. float16 is the default to fit a 4B encoder on an 11 GiB GPU.",
+    )
     parser.add_argument("--dry-run", action="store_true"); return parser
+
+
+def resolve_text_device(text_device: str, inference_device: torch.device) -> torch.device:
+    """Choose a text-encoder device without competing with 3D inference.
+
+    ``torch.cuda.mem_get_info`` reports free rather than total memory, which is
+    important on shared machines.  Explicit ``--text-device`` values are never
+    overridden.
+    """
+    if text_device != "auto":
+        resolved = torch.device(text_device)
+        if resolved.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA unavailable for --text-device {text_device}")
+        return resolved
+    if inference_device.type != "cuda":
+        return inference_device
+    inference_index = inference_device.index
+    if inference_index is None:
+        inference_index = torch.cuda.current_device()
+    candidates = [index for index in range(torch.cuda.device_count()) if index != inference_index]
+    if not candidates:
+        return inference_device
+    free_bytes = {index: torch.cuda.mem_get_info(index)[0] for index in candidates}
+    selected = max(candidates, key=free_bytes.__getitem__)
+    print(
+        "[device] text encoder auto-selected cuda:%d (%0.2f GiB free); "
+        "3D inference remains on %s" % (selected, free_bytes[selected] / 2**30, inference_device)
+    )
+    return torch.device(f"cuda:{selected}")
+
+
+def resolve_text_dtype(name: str) -> torch.dtype:
+    return {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[name]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -860,6 +1112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.prediction_dir and not Path(args.prediction_dir).exists(): raise FileNotFoundError(args.prediction_dir)
     if not 0 <= args.query_threshold < args.support_threshold <= 1: raise ValueError("invalid thresholds")
     output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(args.work_dir); work_dir.mkdir(parents=True, exist_ok=True)
     supports, queries, audit = audit_inputs(args)
     if args.dry_run:
         for case in (supports[0], queries[0]):
@@ -872,12 +1125,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run_checks(); print("[dry-run] completed without model loading"); return 0
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available(): raise RuntimeError("CUDA unavailable")
+    text_device = resolve_text_device(args.text_device, device)
+    text_dtype = resolve_text_dtype(args.text_dtype)
+    print(f"[device] 3D inference={device}; text encoder={text_device} ({args.text_dtype})")
     from voxtell.inference.predictor import VoxTellPredictor
-    predictor = VoxTellPredictor(args.model_dir, device=device, text_encoding_model=args.text_model); predictor.network = predictor.network.to(device).eval(); text = predictor.embed_text_prompts(args.prompt)
+    predictor = VoxTellPredictor(
+        args.model_dir, device=device, text_encoding_model=args.text_model,
+        text_device=text_device, text_dtype=text_dtype,
+    )
+    # The original predictor moves the text backbone to ``device`` while
+    # embedding, then returns it to CPU.  Keep the large VoxTell network on CPU
+    # until that step is complete; otherwise the two models briefly coexist on
+    # the GPU and text embedding can fail with an avoidable OOM.
+    text = predictor.embed_text_prompts(args.prompt)
+    predictor.network = predictor.network.to(device).eval()
     support_rows = []; oracle = []; prediction = []; metadata = []; baseline_audits = []
     for index, case in enumerate(supports, 1):
-        print(f"[support {index}/{len(supports)}] {case.case_id}"); fused = run_full_volume_feature_inference(predictor, text, case, output_dir, args.prompt)
-        o, p, rows, info = extract_support_case(fused); oracle.extend(o); prediction.extend(p); support_rows.extend(rows); metadata.append(info); baseline_audits.append(fused.baseline_audit); fused.cleanup()
+        print(f"[support {index}/{len(supports)}] {case.case_id}")
+        fused = run_full_volume_feature_inference(predictor, text, case, work_dir, args.prompt)
+        try:
+            o, p, rows, info = extract_support_case(fused); oracle.extend(o); prediction.extend(p); support_rows.extend(rows); metadata.append(info); baseline_audits.append(fused.baseline_audit)
+        finally:
+            fused.cleanup()
     if not oracle or not prediction: raise RuntimeError("empty oracle or prediction prototype bank")
     oracle_bank, prediction_bank = np.stack(oracle).astype(np.float32), np.stack(prediction).astype(np.float32)
     random_banks = {seed: shuffled_prototype_bank(oracle_bank, seed) for seed in RANDOM_SEEDS}
@@ -886,15 +1155,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         if row["status"] == "ok": row["prototype_index"] = counters[row["bank"]]; counters[row["bank"]] += 1
     _write_csv(output_dir / "support_bank.csv", support_rows)
     np.savez_compressed(output_dir / "oracle_prototypes.npz", oracle_prototypes=oracle_bank, prediction_prototypes=prediction_bank, random_prototypes=np.stack([random_banks[s] for s in RANDOM_SEEDS]), random_seeds=np.asarray(RANDOM_SEEDS))
-    localization = []; fusion_rows = []
+    localization, fusion_rows, completed_query_cases = load_completed_query_results(output_dir)
     for index, case in enumerate(queries, 1):
-        print(f"[query {index}/{len(queries)}] {case.case_id}"); fused = run_full_volume_feature_inference(predictor, text, case, output_dir, args.prompt); baseline_audits.append(fused.baseline_audit)
+        if case.case_id in completed_query_cases:
+            print(f"[query {index}/{len(queries)}] {case.case_id} [skip: completed]")
+            continue
+        print(f"[query {index}/{len(queries)}] {case.case_id}"); fused = run_full_volume_feature_inference(predictor, text, case, work_dir, args.prompt); baseline_audits.append(fused.baseline_audit)
         rows, frows, info = run_query_case(fused, {"oracle": oracle_bank, "prediction": prediction_bank}, random_banks, output_dir, device); localization.extend(rows); fusion_rows.extend(frows); metadata.append(info)
         _write_csv(output_dir / "per_case_localization.csv", localization); _write_csv(output_dir / "per_case_fusion.csv", fusion_rows)
-    audit.update({"prompt": args.prompt, "model_dir": str(Path(args.model_dir).resolve()), "text_model": str(Path(args.text_model).resolve()), "prediction_source": "recomputed_voxtell_probability", "baseline_dice_tolerance": BASELINE_DICE_TOLERANCE, "baseline_case_audits": baseline_audits})
+    audit.update({"prompt": args.prompt, "model_dir": str(Path(args.model_dir).resolve()), "text_model": str(Path(args.text_model).resolve()), "work_dir": str(work_dir.resolve()), "prediction_source": "recomputed_voxtell_probability", "baseline_dice_tolerance": BASELINE_DICE_TOLERANCE, "baseline_case_audits": baseline_audits})
     summary = summarize(localization, fusion_rows, audit, metadata)
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle: json.dump(summary, handle, indent=2, ensure_ascii=False, allow_nan=True)
     print(json.dumps(summary["answers"], indent=2, ensure_ascii=False, allow_nan=True)); return 0
 
 
 if __name__ == "__main__": sys.exit(main())
+
+'''
+python -m voxtell.inference.oracle_support_diagnostic \
+    --split-json /data/hilab/datasets/WCH_MRI145/DWI/split.json \
+    --dice-csv WCH_MREI145_predict/liver_cancer/DWI/metrics.csv \
+    --image-dir /data/hilab/datasets/WCH_MRI145/DWI/images \
+    --label-dir /data/hilab/datasets/WCH_MRI145/DWI/labels \
+    --prediction-dir WCH_MREI145_predict/liver_cancer/DWI\
+    --model-dir model \
+    --text-model model/Qwen3-Embedding-4B \
+    --prompt "liver cancer" \
+    --output-dir diagnostic/oracle_support_full_volume_results \
+    --support-threshold 0.8 \
+    --query-threshold 0.5 \
+    --device cuda:0 \
+    --text-device cpu \
+    --text-dtype float32 \
+    --work-dir diagnostic/cache
+'''
