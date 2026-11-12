@@ -59,6 +59,11 @@ UNCERTAINTY_COLUMNS = (
     "image_uncertainty",
     "prompt_uncertainty",
 )
+STATISTIC_COLUMNS = (
+    *UNCERTAINTY_COLUMNS,
+    "image_variance",
+    "prompt_variance",
+)
 
 
 def case_id_from_path(path: str | Path) -> str:
@@ -71,10 +76,12 @@ def soft_dice(a: np.ndarray, b: np.ndarray, epsilon: float = 1e-8) -> float:
     """Soft Dice with an explicit empty/empty convention of one."""
     first = np.asarray(a, dtype=np.float64).reshape(-1)
     second = np.asarray(b, dtype=np.float64).reshape(-1)
-    denominator = float(first.sum() + second.sum())
+    denominator = float(np.dot(first, first) + np.dot(second, second))
     if denominator <= epsilon:
         return 1.0
-    return float(2.0 * np.dot(first, second) / denominator)
+    if np.array_equal(first, second):
+        return 1.0
+    return float(2.0 * np.dot(first, second) / (denominator + epsilon))
 
 
 def mean_pairwise_soft_dice(probabilities: Sequence[np.ndarray]) -> float:
@@ -368,7 +375,7 @@ def run_case(
 def summarize(rows: Sequence[dict[str, Any]], quality_threshold: float) -> dict[str, Any]:
     dice = [float(row["baseline_dice"]) for row in rows]
     summary: dict[str, Any] = {}
-    for column in UNCERTAINTY_COLUMNS:
+    for column in STATISTIC_COLUMNS:
         values = [float(row[column]) for row in rows]
         pearson, correlation_cases = correlation(values, dice)
         spearman, _ = correlation(values, dice, rank=True)
@@ -458,7 +465,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cue-case-column", default=None)
     parser.add_argument("--cue-score-column", default=None)
     parser.add_argument(
-        "--cue-direction", choices=("uncertainty", "quality"), default="uncertainty",
+        "--cue-direction", choices=("uncertainty", "quality"), default=None,
         help="meaning of the raw CUE score; quality is negated only for cue_uncertainty",
     )
     parser.add_argument("--device", default="cuda:0")
@@ -485,6 +492,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise FileNotFoundError(path)
     split_json = Path(args.split_json) if args.split_json else None
     cue_csv = Path(args.cue_csv) if args.cue_csv else None
+    if cue_csv is not None and args.cue_direction is None:
+        raise ValueError(
+            "--cue-direction quality/uncertainty must be specified when --cue-csv is used"
+        )
     for path in (split_json, cue_csv):
         if path is not None and not path.is_file():
             raise FileNotFoundError(path)
@@ -531,12 +542,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_csv = output_dir / "per_case_uncertainty.csv"
+    cue_direction = args.cue_direction or "uncertainty"
     rows: list[dict[str, Any]] = []
     for index, case in enumerate(cases, 1):
         print(f"[{index}/{len(cases)}] {case[0]}", flush=True)
         row = run_case(
             predictor, reader, prompt_embeddings, baseline_embedding, case,
-            cue_scores, args.cue_direction, args.image_views, args.seed, args.threshold,
+            cue_scores, cue_direction, args.image_views, args.seed, args.threshold,
         )
         rows.append(row)
         _write_csv(output_csv, rows)  # checkpoint long DWI runs after every case
@@ -577,7 +589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     make_plots(rows, output_dir)
 
     print("\nmetric                 Pearson   Spearman   AUROC     AUPRC     n", flush=True)
-    for column in UNCERTAINTY_COLUMNS:
+    for column in STATISTIC_COLUMNS:
         item = statistics[column]
         print(
             f"{column:22s} {item['pearson_vs_baseline_dice']:9.4f} "

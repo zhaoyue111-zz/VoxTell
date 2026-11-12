@@ -11,10 +11,14 @@ from voxtell.inference.diagnose_uncertainty import (
     binary_dice_from_crop,
     classification_metrics,
     correlation,
+    build_arg_parser,
     load_cue_scores,
+    main,
     mean_pairwise_soft_dice,
     mean_voxel_variance,
     _json_safe,
+    soft_dice,
+    summarize,
     weak_augment,
 )
 
@@ -31,6 +35,10 @@ class TestDiagnoseUncertainty(unittest.TestCase):
         ]
         self.assertEqual(mean_pairwise_soft_dice(unstable), 0.0)
         self.assertEqual(mean_voxel_variance(unstable), 0.25)
+
+    def test_soft_dice_is_one_for_identical_nonbinary_probability_maps(self):
+        probability = np.full((2, 3, 4), 0.1, dtype=np.float32)
+        self.assertEqual(soft_dice(probability, probability), 1.0)
 
     def test_binary_dice_counts_gt_outside_voxtell_crop_as_false_negative(self):
         target = np.zeros((3, 3, 3), dtype=bool)
@@ -73,6 +81,46 @@ class TestDiagnoseUncertainty(unittest.TestCase):
         self.assertEqual(spearman, -1.0)
         self.assertEqual(auroc, 1.0)
         self.assertEqual(auprc, 1.0)
+
+    def test_variance_scores_are_included_in_summary(self):
+        rows = [
+            {
+                "baseline_dice": dice,
+                "cue_uncertainty": uncertainty,
+                "image_uncertainty": uncertainty,
+                "prompt_uncertainty": uncertainty,
+                "image_variance": uncertainty / 10,
+                "prompt_variance": uncertainty / 20,
+            }
+            for dice, uncertainty in ((0.9, 0.1), (0.8, 0.2), (0.3, 0.8), (0.1, 0.9))
+        ]
+        result = summarize(rows, 0.7)
+        self.assertIn("image_variance", result)
+        self.assertIn("prompt_variance", result)
+        self.assertEqual(result["image_variance"]["auroc_high_quality"], 1.0)
+        self.assertEqual(result["prompt_variance"]["auprc_high_quality"], 1.0)
+
+    def test_cue_direction_has_no_implicit_default(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(["--images", "images", "--labels", "labels", "--model", "model"])
+        self.assertIsNone(args.cue_direction)
+
+    def test_cue_csv_requires_explicit_direction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {name: root / name for name in ("images", "labels", "model", "text_model")}
+            for path in paths.values():
+                path.mkdir()
+            cue_csv = root / "cue.csv"
+            cue_csv.touch()
+            with self.assertRaisesRegex(ValueError, "--cue-direction"):
+                main([
+                    "--images", str(paths["images"]),
+                    "--labels", str(paths["labels"]),
+                    "--model", str(paths["model"]),
+                    "--text-model", str(paths["text_model"]),
+                    "--cue-csv", str(cue_csv),
+                ])
 
     def test_json_safe_converts_numpy_scalars_and_nonfinite_values(self):
         self.assertEqual(_json_safe({"count": np.int64(2)}), {"count": 2})
